@@ -1,0 +1,34 @@
+# Human-readable name for this test run (displayed in UI instead of run_id)
+runName: Example Test Run
+
+# Optional custom run ID for this test run. If set, this run ID will be sent to the server.
+# The server will validate that the run ID is URL-safe and not already in use.
+# Supports environment variable expansion with ${env:VAR_NAME} syntax.
+# If not set, the server will generate a unique run ID automatically.
+#runId: ${env:BUILD_ID}
+
+metadata:
+  - name: DUT
+    value: ${env:DUT_MODEL}
+    url: ${env:DUT_URL}
+  - name: Firmware
+    value: ${env:FIRMWARE_BRANCH}
+  - name: TestSystem
+    value: nuts-v2
+    url: ${env:TESTSYSTEM_URL}
+
+group:
+  name: ${env:PRODUCT}
+  metadata:
+    - name: Branch
+      value: ${env:BRANCH}
+      url: ${env:TESTSYSTEM_URL}/${env:BRANCH}
+
+# URL file generation for CI scripts
+# When configured, these files are written after the test run starts,
+# allowing CI scripts to find the URLs to the test results.
+urlFiles:
+  # Path to write the test run URL (optional)
+  runUrlFile: test_run_url.txt
+  # Path to write the group runs URL (optional, only written if run belongs to a group)
+  groupUrlFile: test_group_url.txt
