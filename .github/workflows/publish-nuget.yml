@@ -8,6 +8,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 jobs:
   publish:
@@ -24,12 +25,17 @@ jobs:
       - name: Pack
         run: dotnet pack src/TestRift.NUnit/TestRift.NUnit.csproj -c Release -o artifacts
 
+      - name: NuGet login (OIDC -> temp API key)
+        uses: NuGet/login@v1
+        id: login
+        with:
+          # nuget.org profile name (NOT email). Store it as a secret to avoid leaking identity in logs.
+          user: ${{ secrets.NUGET_USER }}
+
       - name: Publish to nuget.org
-        env:
-          NUGET_API_KEY: ${{ secrets.NUGET_API_KEY }}
         run: |
           dotnet nuget push "artifacts/*.nupkg" \
-            --api-key "$NUGET_API_KEY" \
+            --api-key "${{ steps.login.outputs.NUGET_API_KEY }}" \
             --source "https://api.nuget.org/v3/index.json" \
             --skip-duplicate
 
