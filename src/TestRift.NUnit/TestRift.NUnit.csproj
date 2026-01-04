@@ -8,7 +8,7 @@
     <GenerateAssemblyInfo>true</GenerateAssemblyInfo>
     <IsPackable>true</IsPackable>
     <PackageId>TestRift.NUnit</PackageId>
-    <Version>0.1.0</Version>
+    <Version>0.2.1</Version>
     <Authors>Andreas Anderberg</Authors>
     <Description>TestRift real-time logging and test run metadata plugin for NUnit.</Description>
     <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
