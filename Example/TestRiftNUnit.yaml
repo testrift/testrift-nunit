@@ -1,5 +1,12 @@
+# See https://github.com/testrift/testrift-nunit/blob/main/docs/config.md for more details.
+
 # Server base URL (used for WebSocket + HTTP)
 serverUrl: http://localhost:8080
+
+autoStartServer:
+  enabled: true
+  serverYaml: TestRiftServer.yaml
+  restartOnConfigChange: true
 
 # Human-readable name for this test run (displayed in UI instead of run_id)
 runName: Example Test Run

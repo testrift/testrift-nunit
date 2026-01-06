@@ -39,8 +39,31 @@ namespace TestRift.NUnit
         public string GroupUrlFile { get; set; }
     }
 
+    public class AutoStartServerConfig
+    {
+        /// <summary>
+        /// Enable automatic starting of TestRift Server.
+        /// </summary>
+        public bool Enabled { get; set; } = false;
+
+        /// <summary>
+        /// Optional path to a TestRift Server YAML config file that will be provided to the server
+        /// via the TESTRIFT_SERVER_YAML environment variable when starting it.
+        /// Supports environment variable expansion with ${env:VAR_NAME} syntax.
+        /// </summary>
+        public string ServerYaml { get; set; }
+
+        /// <summary>
+        /// If true, the server is started with --restart-on-config so that if a server is already running
+        /// with a different config, it will be restarted with the new config.
+        /// </summary>
+        public bool RestartOnConfigChange { get; set; } = false;
+    }
+
     public class Config
     {
+        public AutoStartServerConfig AutoStartServer { get; set; } = new();
+
         /// <summary>
         /// Base URL to the TestRift server (used for WebSocket + HTTP).
         /// Example: http://localhost:8080
@@ -78,6 +101,7 @@ namespace TestRift.NUnit
             lock (_lock)
             {
                 var yamlText = File.ReadAllText(filePath);
+                var configDir = Path.GetDirectoryName(Path.GetFullPath(filePath)) ?? Directory.GetCurrentDirectory();
 
                 var deserializer = new DeserializerBuilder()
                     .WithNamingConvention(CamelCaseNamingConvention.Instance)
@@ -117,6 +141,16 @@ namespace TestRift.NUnit
                 // Expand server URL
                 if (!string.IsNullOrEmpty(cfg.ServerUrl))
                     cfg.ServerUrl = VarExpander.Expand(cfg.ServerUrl);
+
+                // Expand auto-start server YAML path (if configured)
+                if (cfg.AutoStartServer != null && !string.IsNullOrEmpty(cfg.AutoStartServer.ServerYaml))
+                {
+                    cfg.AutoStartServer.ServerYaml = VarExpander.Expand(cfg.AutoStartServer.ServerYaml);
+                    if (!Path.IsPathRooted(cfg.AutoStartServer.ServerYaml))
+                    {
+                        cfg.AutoStartServer.ServerYaml = Path.GetFullPath(Path.Combine(configDir, cfg.AutoStartServer.ServerYaml));
+                    }
+                }
 
                 // Expand run ID
                 if (!string.IsNullOrEmpty(cfg.RunId))

@@ -37,6 +37,14 @@ namespace TestRift.NUnit
             {
                 ConfigManager.Load(finalConfigPath);
                 Console.WriteLine($"Loaded TestRift NUnit config: {finalConfigPath}");
+
+                // Optional: auto-start TestRift Server for local dev/CI convenience.
+                var cfg = ConfigManager.Get();
+                var auto = cfg.AutoStartServer;
+                if (auto != null && auto.Enabled)
+                {
+                    ServerAutoStarter.EnsureServerRunning(cfg.ServerUrl, auto.ServerYaml, auto.RestartOnConfigChange);
+                }
             }
         }
 

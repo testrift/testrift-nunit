@@ -8,15 +8,19 @@ TestRift is currently in an **experimental** phase. APIs, configuration, and dat
 
 ### Required: TestRift Server
 
-You need the server running before your tests execute.
+You need the server available before your tests execute. You can either run it yourself or let the plugin auto-start it.
 
-- **Server repo**: `https://github.com/testrift/testrift-server`
-- **Run locally**:
+- **Server repo**: [testrift/testrift-server](https://github.com/testrift/testrift-server)
+- **Run locally (manual)**:
 
 ```bash
 pip install testrift-server
 testrift-server
 ```
+
+- **Auto-start**: set `autoStartServer.enabled: true` in `TestRiftNUnit.yaml`.
+  - To start the server with a specific server config file, set `autoStartServer.serverYaml` (passed as `TESTRIFT_SERVER_YAML`).
+  - To automatically restart the server when the config changes, set `autoStartServer.restartOnConfigChange: true` (starts the server with `--restart-on-config`).
 
 ### Install (NuGet)
 
@@ -52,6 +56,10 @@ All string fields support `${env:VAR_NAME}` expansion (missing variables expand 
 Example `TestRiftNUnit.yaml`:
 
 ```yaml
+autoStartServer:
+  enabled: true
+  serverYaml: TestRiftServer.yaml
+  restartOnConfigChange: true
 serverUrl: http://localhost:8080
 
 runName: CI run ${env:GITHUB_RUN_NUMBER}
@@ -74,6 +82,9 @@ urlFiles:
   runUrlFile: test_run_url.txt
   groupUrlFile: test_group_url.txt
 ```
+
+Notes:
+- `autoStartServerYaml` is resolved relative to the directory containing `TestRiftNUnit.yaml` (so you can keep both files together).
 
 ### Links
 

@@ -2,6 +2,7 @@
 
 `TestRift.NUnit` reads an optional YAML config file to configure:
 
+- Auto-starting the server for local runs (`autoStartServer`)
 - Server connection (`serverUrl`)
 - Run naming (`runName`, optional `runId`)
 - Run metadata (`metadata`)
@@ -34,6 +35,50 @@ runName: CI run ${env:GITHUB_RUN_NUMBER}
 Base URL to the TestRift server (used for WebSocket + HTTP).
 
 Example: `http://localhost:8080`
+
+#### `autoStartServer` (optional)
+
+Configuration block for auto-starting TestRift Server automatically.
+
+- This only runs when a YAML config file is loaded (i.e. `TestRiftNUnit.yaml` exists or `TESTRIFT_NUNIT_YAML` is set).
+- This only supports **local** server URLs (`http://localhost:...`, `http://127.0.0.1:...`, `http://[::1]:...`).
+- It assumes the server is installed via pip and available as the `testrift-server` command on `PATH`.
+- When enabled, the plugin always attempts to start `testrift-server` (even if `/health` is already OK) so that server-side config mismatch checks are enforced.
+- The server compares configs by their **effective values** (config hash), not by filename/path. If your YAML only overrides defaults, it may still be considered identical to the running server’s config.
+
+Example:
+
+```yaml
+autoStartServer:
+  enabled: true
+  serverYaml: ./testrift_server.yaml
+  restartOnConfigChange: false
+serverUrl: http://localhost:8080
+```
+
+Fields:
+
+##### `autoStartServer.enabled` (optional)
+
+If `true`, enables auto-start.
+
+##### `autoStartServer.serverYaml` (optional)
+
+If set, this path will be passed to the server via the `TESTRIFT_SERVER_YAML` environment variable when starting it.
+
+- Supports `${env:VAR_NAME}` expansion.
+- The path can be relative; it will be interpreted relative to the directory containing `TestRiftNUnit.yaml`.
+- If set and the file does not exist, the test run will fail fast with an error.
+- If you run via `dotnet test` and your `TestRiftNUnit.yaml` is copied to the test output directory (`bin/...`), make sure the server YAML is copied there too (or use an absolute path).
+- Windows note: avoid YAML double-quoted paths like `"C:\test\TestRiftServer.yaml"` (because `\t` becomes a TAB). Prefer:
+  - `serverYaml: C:\test\TestRiftServer.yaml`, or
+  - `serverYaml: 'C:\test\TestRiftServer.yaml'` (single quotes), or
+  - `serverYaml: C:/test/TestRiftServer.yaml` (forward slashes), or
+  - `serverYaml: "C:\\test\\TestRiftServer.yaml"` (escaped backslashes)
+
+##### `autoStartServer.restartOnConfigChange` (optional)
+
+If `true`, starts the server with `--restart-on-config`. If a server is already running on the port with a different config, it will be shut down and restarted with the new config.
 
 #### `runName` (optional)
 
