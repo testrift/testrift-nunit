@@ -256,7 +256,20 @@ namespace TestRift.NUnit
 
                             foreach (var version in versions)
                             {
-                                var wrapperPathSh = Path.Combine(version.Path, "content", "testrift-server.sh");
+                                // Try tools/ first (always extracted, accessible at runtime)
+                                var wrapperPathSh = Path.Combine(version.Path, "tools", "testrift-server.sh");
+                                if (File.Exists(wrapperPathSh))
+                                {
+                                    return wrapperPathSh;
+                                }
+                                // Try contentFiles (PackageReference projects, but may not be extracted)
+                                wrapperPathSh = Path.Combine(version.Path, "contentFiles", "any", "any", "testrift-server.sh");
+                                if (File.Exists(wrapperPathSh))
+                                {
+                                    return wrapperPathSh;
+                                }
+                                // Fall back to content (packages.config projects)
+                                wrapperPathSh = Path.Combine(version.Path, "content", "testrift-server.sh");
                                 if (File.Exists(wrapperPathSh))
                                 {
                                     return wrapperPathSh;
@@ -280,7 +293,20 @@ namespace TestRift.NUnit
 
                 foreach (var version in versions)
                 {
-                    var wrapperPathSh = Path.Combine(version.Path, "content", "testrift-server.sh");
+                    // Try tools/ first (always extracted, accessible at runtime)
+                    var wrapperPathSh = Path.Combine(version.Path, "tools", "testrift-server.sh");
+                    if (File.Exists(wrapperPathSh))
+                    {
+                        return wrapperPathSh;
+                    }
+                    // Try contentFiles (PackageReference projects, but may not be extracted)
+                    wrapperPathSh = Path.Combine(version.Path, "contentFiles", "any", "any", "testrift-server.sh");
+                    if (File.Exists(wrapperPathSh))
+                    {
+                        return wrapperPathSh;
+                    }
+                    // Fall back to content (packages.config projects)
+                    wrapperPathSh = Path.Combine(version.Path, "content", "testrift-server.sh");
                     if (File.Exists(wrapperPathSh))
                     {
                         return wrapperPathSh;
@@ -438,11 +464,17 @@ namespace TestRift.NUnit
             var nugetPath = FindNuGetPackageServer();
             if (!string.IsNullOrWhiteSpace(nugetPath) && File.Exists(nugetPath))
             {
+                Console.WriteLine($"[TestRift] Found TestRift Server in NuGet package: {nugetPath}");
                 return nugetPath;
             }
 
             // Fall back to PATH (pip-installed)
-            return FindCommandOnPathWindows("testrift-server");
+            var pathServer = FindCommandOnPathWindows("testrift-server");
+            if (!string.IsNullOrWhiteSpace(pathServer))
+            {
+                Console.WriteLine($"[TestRift] Found TestRift Server on PATH (pip-installed): {pathServer}");
+            }
+            return pathServer;
         }
 
         /// <summary>
@@ -495,7 +527,20 @@ namespace TestRift.NUnit
 
                 foreach (var version in versions)
                 {
-                    var wrapperPath = Path.Combine(version.Path, "content", "testrift-server.bat");
+                    // Try tools/ first (always extracted, accessible at runtime)
+                    var wrapperPath = Path.Combine(version.Path, "tools", "testrift-server.bat");
+                    if (File.Exists(wrapperPath))
+                    {
+                        return wrapperPath;
+                    }
+                    // Try contentFiles (PackageReference projects, but may not be extracted)
+                    wrapperPath = Path.Combine(version.Path, "contentFiles", "any", "any", "testrift-server.bat");
+                    if (File.Exists(wrapperPath))
+                    {
+                        return wrapperPath;
+                    }
+                    // Fall back to content (packages.config projects)
+                    wrapperPath = Path.Combine(version.Path, "content", "testrift-server.bat");
                     if (File.Exists(wrapperPath))
                     {
                         return wrapperPath;
@@ -523,7 +568,20 @@ namespace TestRift.NUnit
 
             foreach (var version in versions)
             {
-                var wrapperPath = Path.Combine(version.Path, "content", "testrift-server.bat");
+                // Try tools/ first (always extracted, accessible at runtime)
+                var wrapperPath = Path.Combine(version.Path, "tools", "testrift-server.bat");
+                if (File.Exists(wrapperPath))
+                {
+                    return wrapperPath;
+                }
+                // Try contentFiles (PackageReference projects, but may not be extracted)
+                wrapperPath = Path.Combine(version.Path, "contentFiles", "any", "any", "testrift-server.bat");
+                if (File.Exists(wrapperPath))
+                {
+                    return wrapperPath;
+                }
+                // Fall back to content (packages.config projects)
+                wrapperPath = Path.Combine(version.Path, "content", "testrift-server.bat");
                 if (File.Exists(wrapperPath))
                 {
                     return wrapperPath;
