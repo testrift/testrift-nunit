@@ -1,7 +1,8 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
-    <TargetFramework>net6.0</TargetFramework>
+    <TargetFrameworks>net6.0;net462</TargetFrameworks>
+    <LangVersion>9.0</LangVersion>
     <AssemblyName>TestRift.NUnit</AssemblyName>
     <RootNamespace>TestRift.NUnit</RootNamespace>
     <OutputType>Library</OutputType>
@@ -30,6 +31,15 @@
     <PackageReference Include="NUnit" Version="3.14.0" />
     <PackageReference Include="System.Text.Json" Version="8.0.5" />
     <PackageReference Include="YamlDotNet" Version="13.7.1" />
+  </ItemGroup>
+
+  <!-- Additional dependencies for .NET Framework 4.6.2 -->
+  <ItemGroup Condition="'$(TargetFramework)' == 'net462'">
+    <PackageReference Include="System.Net.Http" Version="4.3.4" />
+    <PackageReference Include="IsExternalInit" Version="1.0.3">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
   </ItemGroup>
 
 </Project>

@@ -396,7 +396,7 @@ namespace TestRift.NUnit
             // Normalize the stack trace into a list of lines. This becomes the canonical representation.
             var normalizedLines = lines != null
                 ? new List<string>(lines)
-                : new List<string>(stackTrace.Replace("\r\n", "\n").Split('\n', StringSplitOptions.RemoveEmptyEntries));
+                : new List<string>(stackTrace.Replace("\r\n", "\n").Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries));
 
             var data = new
             {
@@ -700,7 +700,7 @@ namespace TestRift.NUnit
                 var uploadUrl = $"{_serverBaseUrl}/api/attachments/{_runId}/{testCaseId}/upload";
 
                 using (var form = new MultipartFormDataContent())
-                using (var fileContent = new ByteArrayContent(await File.ReadAllBytesAsync(filePath)))
+                using (var fileContent = new ByteArrayContent(await ReadAllBytesAsync(filePath)))
                 {
                     fileContent.Headers.ContentType = new System.Net.Http.Headers.MediaTypeHeaderValue("application/octet-stream");
                     form.Add(fileContent, "attachment", fileName);
@@ -729,6 +729,15 @@ namespace TestRift.NUnit
                 ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Attachment upload error: {ex.Message}");
                 return false;
             }
+        }
+
+        private static async Task<byte[]> ReadAllBytesAsync(string path)
+        {
+#if NET462
+            return await Task.Run(() => File.ReadAllBytes(path));
+#else
+            return await File.ReadAllBytesAsync(path);
+#endif
         }
 
         public void Dispose()

@@ -118,7 +118,7 @@ namespace TestRift.NUnit
 
         private static void RunStartAndWaitForExit(string serverYamlPath, bool restartOnConfigChange)
         {
-            if (OperatingSystem.IsWindows())
+            if (IsWindows())
             {
                 // Preflight: make sure the command is on PATH for the test process environment.
                 // This often fails if testrift-server was installed into a venv that's not active for dotnet test.
@@ -143,7 +143,7 @@ namespace TestRift.NUnit
 
         private static void RunStartAndWaitForHealthy(string serverYamlPath, bool restartOnConfigChange, int port, int startupTimeoutMs)
         {
-            if (OperatingSystem.IsWindows())
+            if (IsWindows())
             {
                 // IMPORTANT: we must start the long-lived server "breakaway" from the testhost job object,
                 // otherwise vstest/dotnet test can hang waiting for child processes to exit.
@@ -549,7 +549,7 @@ namespace TestRift.NUnit
             // Keep it tight; this should be instant.
             if (!p.WaitForExit(1500))
             {
-                try { p.Kill(entireProcessTree: true); } catch { }
+                try { KillProcessAndChildren(p); } catch { }
                 throw new TimeoutException($"Timed out while checking PATH for '{command}' via where.exe.");
             }
             if (p.ExitCode != 0)
@@ -613,12 +613,31 @@ namespace TestRift.NUnit
         {
             try
             {
-                Process.GetProcessById(pid).Kill(entireProcessTree: true);
+                var proc = Process.GetProcessById(pid);
+                KillProcessAndChildren(proc);
             }
             catch
             {
                 // ignore
             }
+        }
+
+        private static bool IsWindows()
+        {
+#if NET462
+            return Environment.OSVersion.Platform == PlatformID.Win32NT;
+#else
+            return OperatingSystem.IsWindows();
+#endif
+        }
+
+        private static void KillProcessAndChildren(Process process)
+        {
+#if NET462
+            process.Kill();
+#else
+            process.Kill(entireProcessTree: true);
+#endif
         }
 
         private static Uri[] GetProbeBaseUris(Uri baseUri)
