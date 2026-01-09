@@ -14,7 +14,12 @@ jobs:
         os: [ubuntu-latest, windows-latest]
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+    - name: Checkout testrift-server
+      uses: actions/checkout@v4
+      with:
+        repository: testrift/testrift-server
+        path: testrift-server
 
     - name: Setup .NET
       uses: actions/setup-dotnet@v3
@@ -25,6 +30,9 @@ jobs:
       uses: actions/setup-python@v4
       with:
         python-version: '3.11'
+
+    - name: Build local TestRift.Server package
+      run: dotnet pack testrift-server/nuget/TestRift.Server/TestRift.Server.csproj -c Release
 
     - name: Restore dependencies
       run: dotnet restore
@@ -46,7 +54,12 @@ jobs:
     runs-on: windows-latest
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
+    - name: Checkout testrift-server
+      uses: actions/checkout@v4
+      with:
+        repository: testrift/testrift-server
+        path: testrift-server
 
     - name: Setup .NET
       uses: actions/setup-dotnet@v3
@@ -60,6 +73,9 @@ jobs:
 
     - name: Setup MSBuild
       uses: microsoft/setup-msbuild@v1
+
+    - name: Build local TestRift.Server package
+      run: dotnet pack testrift-server/nuget/TestRift.Server/TestRift.Server.csproj -c Release
 
     - name: Restore dependencies
       run: dotnet restore
