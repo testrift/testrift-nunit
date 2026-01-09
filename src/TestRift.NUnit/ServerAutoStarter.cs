@@ -56,7 +56,7 @@ namespace TestRift.NUnit
             var wasHealthy = IsHealthyAny(probeBaseUris, "/health");
 
             var serverPath = FindTestRiftServer();
-            var isNuGet = serverPath != null && serverPath.EndsWith(".bat", StringComparison.OrdinalIgnoreCase);
+            var isNuGet = serverPath != null && serverPath.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase);
             var source = isNuGet ? "NuGet package" : "pip";
             Console.WriteLine($"[TestRift] autoStartServer: starting TestRift Server ({source}) for {baseUri}...");
             if (!string.IsNullOrWhiteSpace(serverYamlPath))
@@ -229,44 +229,6 @@ namespace TestRift.NUnit
 
         private static string FindNuGetPackageServerPosix()
         {
-            // Similar to Windows, but look for .sh script
-            var assemblyLocation = typeof(ServerAutoStarter).Assembly.Location;
-            if (!string.IsNullOrWhiteSpace(assemblyLocation))
-            {
-                var assemblyDir = Path.GetDirectoryName(assemblyLocation);
-                if (!string.IsNullOrWhiteSpace(assemblyDir))
-                {
-                    var wrapperPath = Path.Combine(assemblyDir, "testrift-server.sh");
-                    if (File.Exists(wrapperPath))
-                    {
-                        return wrapperPath;
-                    }
-
-                    var packagesDir = Path.Combine(assemblyDir, "..", "..", "packages");
-                    if (Directory.Exists(packagesDir))
-                    {
-                        var testriftServerDir = Path.Combine(packagesDir, "TestRift.Server");
-                        if (Directory.Exists(testriftServerDir))
-                        {
-                            var versions = Directory.GetDirectories(testriftServerDir)
-                                .Select(d => new { Path = d, Version = Path.GetFileName(d) })
-                                .Where(x => System.Version.TryParse(x.Version, out _))
-                                .OrderByDescending(x => System.Version.Parse(x.Version))
-                                .ToList();
-
-                            foreach (var version in versions)
-                            {
-                                var wrapperPathSh = Path.Combine(version.Path, "content", "testrift-server.sh");
-                                if (File.Exists(wrapperPathSh))
-                                {
-                                    return wrapperPathSh;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
             // Check NuGet global cache (~/.nuget/packages)
             var home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var nugetCache = Path.Combine(home, ".nuget", "packages", "testrift.server");
@@ -280,10 +242,10 @@ namespace TestRift.NUnit
 
                 foreach (var version in versions)
                 {
-                    var wrapperPathSh = Path.Combine(version.Path, "content", "testrift-server.sh");
-                    if (File.Exists(wrapperPathSh))
+                    var wrapperPath = Path.Combine(version.Path, "tools", "testrift-server.sh");
+                    if (File.Exists(wrapperPath))
                     {
-                        return wrapperPathSh;
+                        return wrapperPath;
                     }
                 }
             }
@@ -316,78 +278,6 @@ namespace TestRift.NUnit
             }
         }
 
-        private static StartDiagnostics RunWindowsStartProcessAndWait(string serverYamlPath, bool waitForExit, int port, int startupTimeoutMs)
-        {
-            var serverExePath = FindTestRiftServer();
-
-            var envPrefix = "";
-            if (!string.IsNullOrWhiteSpace(serverYamlPath))
-            {
-                var escaped = EscapeForPowerShellSingleQuoted(serverYamlPath);
-                envPrefix = $"$env:TESTRIFT_SERVER_YAML='{escaped}'; ";
-            }
-
-            var stdoutPath = Path.Combine(Path.GetTempPath(), $"testrift-server-autostart-{Guid.NewGuid():N}.stdout.log");
-            var stderrPath = Path.Combine(Path.GetTempPath(), $"testrift-server-autostart-{Guid.NewGuid():N}.stderr.log");
-            var stdoutPs = EscapeForPowerShellSingleQuoted(stdoutPath);
-            var stderrPs = EscapeForPowerShellSingleQuoted(stderrPath);
-
-            string ps;
-            if (waitForExit)
-            {
-                // Mode 1: start and block until the new process exits (startup guard result).
-                ps =
-                    "$ErrorActionPreference='Stop'; " +
-                    envPrefix +
-                    $"$p = Start-Process -FilePath 'testrift-server' -WindowStyle Hidden -PassThru -RedirectStandardOutput '{stdoutPs}' -RedirectStandardError '{stderrPs}'; " +
-                    "$p.WaitForExit(); " +
-                    "exit $p.ExitCode";
-            }
-            else
-            {
-                // Mode 2: start and block until /health responds OR process exits OR timeout.
-                var timeoutMs = Math.Max(1000, startupTimeoutMs);
-                ps =
-                    "$ErrorActionPreference='Stop'; " +
-                    envPrefix +
-                    $"$p = Start-Process -FilePath 'testrift-server' -WindowStyle Hidden -PassThru -RedirectStandardOutput '{stdoutPs}' -RedirectStandardError '{stderrPs}'; " +
-                    $"$deadline = (Get-Date).AddMilliseconds({timeoutMs}); " +
-                    "while ((Get-Date) -lt $deadline) { " +
-                    "  if ($p.HasExited) { exit $p.ExitCode } " +
-                    $"  try {{ $r = Invoke-WebRequest -UseBasicParsing -TimeoutSec 1 -Uri 'http://127.0.0.1:{port}/health'; if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 300) {{ exit 0 }} }} catch {{ }} " +
-                    "  Start-Sleep -Milliseconds 200; " +
-                    "} " +
-                    // Timeout: if process is still running, kill it so we don't leak a broken server.
-                    "if (-not $p.HasExited) { try { Stop-Process -Id $p.Id -Force } catch { } } " +
-                    "exit 3";
-            }
-
-            var psi = new ProcessStartInfo
-            {
-                FileName = "powershell",
-                Arguments = "-NoProfile -NonInteractive -Command \"" + ps.Replace("\"", "`\"") + "\"",
-                UseShellExecute = false,
-                CreateNoWindow = true,
-                WorkingDirectory = Environment.CurrentDirectory,
-            };
-
-            using var p = Process.Start(psi);
-            if (p == null)
-            {
-                throw new InvalidOperationException("Failed to spawn PowerShell to start `testrift-server`.");
-            }
-
-            // Allow some extra time for the wrapper to return, but keep it bounded to avoid hanging tests.
-            p.WaitForExit(Math.Max(8000, startupTimeoutMs + 3000));
-            return new StartDiagnostics
-            {
-                ServerExePath = serverExePath,
-                ServerYamlPath = serverYamlPath ?? "",
-                StdoutPath = stdoutPath,
-                StderrPath = stderrPath,
-            };
-        }
-
         private static StartDiagnostics StartServerBreakawayWindows(string serverYamlPath, bool restartOnConfigChange)
         {
             var serverExePath = FindTestRiftServer();
@@ -408,9 +298,28 @@ namespace TestRift.NUnit
                 env["TESTRIFT_SERVER_YAML"] = serverYamlPath;
             }
 
+            // If this is a .ps1 script, wrap it in PowerShell invocation
+            var isPs1Script = serverExePath?.EndsWith(".ps1", StringComparison.OrdinalIgnoreCase) ?? false;
+            string actualExePath;
+            string actualArguments;
+
+            if (isPs1Script)
+            {
+                actualExePath = "powershell";
+                var scriptPath = serverExePath;
+                var scriptArgs = restartOnConfigChange ? "--restart-on-config" : "";
+                actualArguments = $"-NoProfile -NonInteractive -File \"{scriptPath}\" {scriptArgs}".Trim();
+            }
+            else
+            {
+                // pip-installed testrift-server
+                actualExePath = serverExePath;
+                actualArguments = restartOnConfigChange ? "--restart-on-config" : "";
+            }
+
             var started = CreateProcessBreakawayWithRedirects(
-                exePath: serverExePath,
-                arguments: restartOnConfigChange ? "--restart-on-config" : "",
+                exePath: actualExePath,
+                arguments: actualArguments,
                 workingDirectory: Environment.CurrentDirectory,
                 environment: env,
                 stdoutPath: stdoutPath,
@@ -430,7 +339,7 @@ namespace TestRift.NUnit
 
         /// <summary>
         /// Finds the TestRift Server executable/wrapper script.
-        /// First checks for NuGet package, then falls back to PATH (pip-installed).
+        /// First checks for NuGet package (.ps1 on Windows), then falls back to PATH (pip-installed).
         /// </summary>
         private static string FindTestRiftServer()
         {
@@ -446,41 +355,10 @@ namespace TestRift.NUnit
         }
 
         /// <summary>
-        /// Attempts to find the TestRift.Server NuGet package wrapper script.
+        /// Attempts to find the TestRift.Server NuGet package wrapper script (.ps1).
         /// </summary>
         private static string FindNuGetPackageServer()
         {
-            // Strategy: Look for the wrapper script in common NuGet package locations
-            // 1. Check near the executing assembly (for PackageReference scenarios)
-            // 2. Check in packages directory (for packages.config scenarios)
-            // 3. Check in NuGet global cache
-
-            var assemblyLocation = typeof(ServerAutoStarter).Assembly.Location;
-            if (!string.IsNullOrWhiteSpace(assemblyLocation))
-            {
-                var assemblyDir = Path.GetDirectoryName(assemblyLocation);
-                if (!string.IsNullOrWhiteSpace(assemblyDir))
-                {
-                    // For PackageReference, content files might be in the output directory
-                    var wrapperPath = Path.Combine(assemblyDir, "testrift-server.bat");
-                    if (File.Exists(wrapperPath))
-                    {
-                        return wrapperPath;
-                    }
-
-                    // Or in a packages subdirectory
-                    var packagesDir = Path.Combine(assemblyDir, "..", "..", "packages");
-                    if (Directory.Exists(packagesDir))
-                    {
-                        var nugetWrapper = FindInPackagesDirectory(packagesDir);
-                        if (!string.IsNullOrWhiteSpace(nugetWrapper))
-                        {
-                            return nugetWrapper;
-                        }
-                    }
-                }
-            }
-
             // Check NuGet global cache (typically %USERPROFILE%\.nuget\packages)
             var userProfile = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
             var nugetCache = Path.Combine(userProfile, ".nuget", "packages", "testrift.server");
@@ -495,38 +373,11 @@ namespace TestRift.NUnit
 
                 foreach (var version in versions)
                 {
-                    var wrapperPath = Path.Combine(version.Path, "content", "testrift-server.bat");
+                    var wrapperPath = Path.Combine(version.Path, "tools", "testrift-server.ps1");
                     if (File.Exists(wrapperPath))
                     {
                         return wrapperPath;
                     }
-                }
-            }
-
-            return null;
-        }
-
-        private static string FindInPackagesDirectory(string packagesDir)
-        {
-            var testriftServerDir = Path.Combine(packagesDir, "TestRift.Server");
-            if (!Directory.Exists(testriftServerDir))
-            {
-                return null;
-            }
-
-            // Find the latest version
-            var versions = Directory.GetDirectories(testriftServerDir)
-                .Select(d => new { Path = d, Version = Path.GetFileName(d) })
-                .Where(x => System.Version.TryParse(x.Version, out _))
-                .OrderByDescending(x => System.Version.Parse(x.Version))
-                .ToList();
-
-            foreach (var version in versions)
-            {
-                var wrapperPath = Path.Combine(version.Path, "content", "testrift-server.bat");
-                if (File.Exists(wrapperPath))
-                {
-                    return wrapperPath;
                 }
             }
 
@@ -594,12 +445,6 @@ namespace TestRift.NUnit
             {
                 return "";
             }
-        }
-
-        private static string EscapeForPowerShellSingleQuoted(string s)
-        {
-            // In PowerShell single-quoted strings, you escape ' by doubling it.
-            return (s ?? "").Replace("'", "''");
         }
 
         private static string EscapeForPosixSingleQuoted(string s)
