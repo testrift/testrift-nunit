@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net6.0</TargetFramework>
+    <IsPackable>false</IsPackable>
+    <IsTestProject>true</IsTestProject>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- Test with maximum supported versions (just below next major) -->
+    <PackageReference Include="NUnit" Version="3.14.*" />
+    <PackageReference Include="NUnit3TestAdapter" Version="4.*" />
+    <!-- Microsoft.NET.Test.Sdk 17.12+ requires net8.0, cap at 17.11.* for net6.0 support -->
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.11.*" />
+    <PackageReference Include="System.Text.Json" Version="8.*" />
+    <PackageReference Include="YamlDotNet" Version="15.*" />
+    <PackageReference Include="TestRift.Server" Version="*" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\src\TestRift.NUnit\TestRift.NUnit.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\TestRift.NUnit.Tests\**\*.cs" Exclude="..\TestRift.NUnit.Tests\obj\**\*.cs;..\TestRift.NUnit.Tests\bin\**\*.cs" />
+    <None Include="..\TestRift.NUnit.Tests\*.yaml" CopyToOutputDirectory="Always" />
+    <None Include="..\TestRiftServer.yaml" CopyToOutputDirectory="Always" />
+  </ItemGroup>
+
+</Project>

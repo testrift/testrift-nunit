@@ -1,4 +1,4 @@
 # See https://github.com/testrift/testrift-server/blob/main/docs/server_config.md for more details.
 server:
-  port: 8080 
+  port: 8080
   localhost_only: true

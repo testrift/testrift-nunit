@@ -1,0 +1,5 @@
+# Shared TestRift Server configuration for test projects
+# Uses port 19999 to avoid conflicts with development servers on default port 8080
+server:
+  port: 19999
+  localhost_only: true

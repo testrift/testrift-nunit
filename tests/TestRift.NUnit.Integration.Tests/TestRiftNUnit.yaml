@@ -1,0 +1,14 @@
+# Integration test configuration
+autoStartServer:
+  enabled: true
+  serverYaml: TestRiftServer.yaml
+
+serverUrl: http://localhost:19999
+
+runName: Integration Test Run
+
+metadata:
+  - name: Test Type
+    value: Integration
+  - name: Framework
+    value: NUnit 3.x

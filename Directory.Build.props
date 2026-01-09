@@ -1,0 +1,16 @@
+<Project>
+  <!-- Allow all projects to restore TestRift.Server from a local checkout when available -->
+  <PropertyGroup>
+    <_RepoLocalFeed>$([MSBuild]::NormalizePath('$(MSBuildThisFileDirectory)', 'testrift-server/nuget/TestRift.Server/bin/Release'))</_RepoLocalFeed>
+    <_SiblingLocalFeed>$([MSBuild]::NormalizePath('$(MSBuildThisFileDirectory)', '../testrift-server/nuget/TestRift.Server/bin/Release'))</_SiblingLocalFeed>
+  </PropertyGroup>
+
+  <PropertyGroup>
+    <LocalTestRiftServerFeed Condition="'$(LocalTestRiftServerFeed)' == '' and Exists('$(_RepoLocalFeed)')">$(_RepoLocalFeed)</LocalTestRiftServerFeed>
+    <LocalTestRiftServerFeed Condition="'$(LocalTestRiftServerFeed)' == '' and Exists('$(_SiblingLocalFeed)')">$(_SiblingLocalFeed)</LocalTestRiftServerFeed>
+  </PropertyGroup>
+
+  <PropertyGroup Condition="'$(LocalTestRiftServerFeed)' != '' and '$(LocalTestRiftServerFeed)' != '__disable__' and Exists('$(LocalTestRiftServerFeed)')">
+    <RestoreAdditionalProjectSources>$(RestoreAdditionalProjectSources);$(LocalTestRiftServerFeed)</RestoreAdditionalProjectSources>
+  </PropertyGroup>
+</Project>

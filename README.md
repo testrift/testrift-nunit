@@ -17,6 +17,9 @@ TestRift is currently in an **experimental** phase. APIs, configuration, and dat
   - `ExampleTests.csproj` - Project file for example tests
   - `run-tests.bat` - Convenience script to run tests
 
+- `tests/` - Test projects for TestRift.NUnit
+  - See [tests/README.md](tests/README.md) for details
+
 ## Features
 
 - **Assembly-level logging**: Simply add `[assembly: TRLogger]` to your test project
@@ -36,7 +39,7 @@ TestRift is currently in an **experimental** phase. APIs, configuration, and dat
    ```bash
    cd testrift-nunit/src/TestRift.NUnit
    dotnet build
-   
+
    cd ../../Example
    dotnet build
    ```
@@ -70,9 +73,9 @@ TestRift is currently in an **experimental** phase. APIs, configuration, and dat
 3. **Add the assembly-level attribute and SetUpFixture** to your test project:
    ```csharp
    using TestRift.NUnit; // Add this
-   
+
    [assembly: TRLogger] // Add this
-   
+
    namespace ExampleTests
    {
       // Add this
@@ -80,7 +83,7 @@ TestRift is currently in an **experimental** phase. APIs, configuration, and dat
       public class MyRunHooks : RunHooks
       {
       }
-      
+
       [TestFixture]
       public class MyTests
       {
@@ -111,9 +114,9 @@ See [docs/config.md](docs/config.md) for the full schema and examples.
 
 ## WebSocket Protocol
 
-The NUnit plugin uses the same WebSocket message types and payloads described in 
-[websocket_protocol.md](../docs/websocket_protocol.md). All messages it sends (`run_started`, 
-`test_case_started`, `log_batch`, `exception`, `test_case_finished`, `run_finished`) follow 
+The NUnit plugin uses the same WebSocket message types and payloads described in
+[websocket_protocol.md](../docs/websocket_protocol.md). All messages it sends (`run_started`,
+`test_case_started`, `log_batch`, `exception`, `test_case_finished`, `run_finished`) follow
 that documented format.
 
 ## Exception Reporting
@@ -191,3 +194,7 @@ wsHelper.QueueLogMessage(
     testCaseId: TestContext.CurrentContext.Test.FullName
 );
 ```
+
+## Testing
+
+See [tests/README.md](tests/README.md) for more details.

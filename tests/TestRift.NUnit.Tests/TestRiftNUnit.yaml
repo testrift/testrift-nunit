@@ -1,0 +1,7 @@
+# TestRift NUnit configuration for unit tests
+serverUrl: http://localhost:19999
+
+autoStartServer:
+  enabled: true
+  serverYaml: TestRiftServer.yaml
+  restartOnConfigChange: false
