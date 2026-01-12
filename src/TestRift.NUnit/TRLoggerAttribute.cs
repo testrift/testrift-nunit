@@ -87,7 +87,17 @@ namespace TestRift.NUnit
 
                 _fileWriter?.WriteLine($"[END] {test.FullName} => {TestContext.CurrentContext.Result.Outcome}");
                 _fileWriter?.Dispose();
-                Console.SetOut(_originalConsole);
+                _fileWriter = null;
+
+                if (_originalConsole != null)
+                {
+                    Console.SetOut(_originalConsole);
+                    _originalConsole = null;
+                }
+                else
+                {
+                    ThreadSafeFileLogger.Log($"[WARN] Original console writer missing when ending {test.FullName}; skipping Console.SetOut");
+                }
 
                 TeardownMonitor.OnActivity(
                     GenerateTestCaseId(test.FullName),
