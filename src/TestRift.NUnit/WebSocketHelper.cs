@@ -25,6 +25,8 @@ namespace TestRift.NUnit
         private readonly SemaphoreSlim _flushSemaphore = new SemaphoreSlim(1, 1);
         private volatile bool _isFlushing = false;
         private readonly HttpClient _httpClient;
+        private CancellationTokenSource _receiveLoopCts;
+        private Task _receiveLoopTask;
         // Tracks test cases that have reported unexpected/unhandled errors (is_error = true)
         // so we can map their final status to "error" instead of "failed".
         private readonly ConcurrentDictionary<string, bool> _testCasesWithErrors = new ConcurrentDictionary<string, bool>();
@@ -62,6 +64,7 @@ namespace TestRift.NUnit
             try
             {
                 _webSocket = new ClientWebSocket();
+                _webSocket.Options.KeepAliveInterval = TimeSpan.FromSeconds(30);
                 var uri = new Uri(_serverBaseUrl.Replace("http://", "ws://").Replace("https://", "wss://") + "/ws/nunit");
                 await _webSocket.ConnectAsync(uri, CancellationToken.None);
 
@@ -101,6 +104,8 @@ namespace TestRift.NUnit
 
             // Wait for server response with run_id and URLs
             await WaitForRunStartedResponse();
+
+            StartPassiveReceiveLoop();
         }
 
         private string GetRunName()
@@ -180,6 +185,89 @@ namespace TestRift.NUnit
                 throw new InvalidOperationException("Timeout waiting for run_started_response from server");
             }
             // Don't catch other exceptions - let them propagate to abort the test run
+        }
+
+        private void StartPassiveReceiveLoop()
+        {
+            if (_receiveLoopTask != null && !_receiveLoopTask.IsCompleted)
+            {
+                return;
+            }
+
+            _receiveLoopCts?.Cancel();
+            _receiveLoopCts?.Dispose();
+
+            _receiveLoopCts = new CancellationTokenSource();
+            _receiveLoopTask = Task.Run(() => PassiveReceiveLoopAsync(_receiveLoopCts.Token));
+        }
+
+        private async Task PassiveReceiveLoopAsync(CancellationToken token)
+        {
+            var buffer = new byte[1024];
+
+            while (!token.IsCancellationRequested)
+            {
+                if (_webSocket == null)
+                {
+                    await Task.Delay(250, token);
+                    continue;
+                }
+
+                try
+                {
+                    var result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), token);
+
+                    if (result.MessageType == WebSocketMessageType.Close)
+                    {
+                        ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Server closed WebSocket: {_webSocket.CloseStatus} {_webSocket.CloseStatusDescription}");
+                        await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
+                        break;
+                    }
+
+                    if (result.MessageType == WebSocketMessageType.Text && result.Count > 0)
+                    {
+                        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
+                        ThreadSafeFileLogger.Log($"Received server message: {message}");
+                    }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
+                }
+                catch (ObjectDisposedException)
+                {
+                    break;
+                }
+                catch (Exception ex)
+                {
+                    ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Passive receive loop error: {ex.Message}");
+                    await Task.Delay(1000, token);
+                }
+            }
+        }
+
+        private void StopPassiveReceiveLoop()
+        {
+            if (_receiveLoopCts == null)
+            {
+                return;
+            }
+
+            try
+            {
+                _receiveLoopCts.Cancel();
+                _receiveLoopTask?.Wait(TimeSpan.FromSeconds(5));
+            }
+            catch (AggregateException ex)
+            {
+                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Error stopping receive loop: {ex.InnerException?.Message ?? ex.Message}");
+            }
+            finally
+            {
+                _receiveLoopCts.Dispose();
+                _receiveLoopCts = null;
+                _receiveLoopTask = null;
+            }
         }
 
         private void WriteUrlFilesFromResponse(JsonElement root)
@@ -744,6 +832,7 @@ namespace TestRift.NUnit
         {
             if (!_disposed)
             {
+                StopPassiveReceiveLoop();
                 _batchTimer?.Dispose();
                 _webSocket?.Dispose();
                 _httpClient?.Dispose();
