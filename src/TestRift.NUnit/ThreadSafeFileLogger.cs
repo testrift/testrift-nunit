@@ -8,7 +8,7 @@ namespace TestRift.NUnit
     public static class ThreadSafeFileLogger
     {
         private static readonly object _lock = new object();
-        private static readonly string _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "websocket_debug.log");
+        private static readonly string _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "testrift_nunit.log");
 
         public static void Log(string message)
         {
