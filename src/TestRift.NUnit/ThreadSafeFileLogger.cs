@@ -1,5 +1,6 @@
 using System;
 using System.IO;
+using System.Net.WebSockets;
 using System.Threading;
 
 namespace TestRift.NUnit
@@ -58,6 +59,26 @@ namespace TestRift.NUnit
         public static void LogSendFailed(string error)
         {
             Log($"Send failed: {error}");
+        }
+
+        public static void LogSendStarting(long messageId, string messageType, string stateSnapshot)
+        {
+            Log($"Send[{messageId}] starting (type={messageType}, socket={stateSnapshot})");
+        }
+
+        public static void LogSendCompleted(long messageId, string messageType, int byteCount)
+        {
+            Log($"Send[{messageId}] completed (type={messageType}, bytes={byteCount})");
+        }
+
+        public static void LogWebSocketStateDetails(string context, WebSocketState? state, WebSocketCloseStatus? closeStatus, string closeDescription)
+        {
+            Log($"WebSocket state ({context}): state={state?.ToString() ?? "null"}, closeStatus={closeStatus?.ToString() ?? "null"}, closeDescription={closeDescription ?? "null"}");
+        }
+
+        public static void LogWebSocketException(string context, Exception ex)
+        {
+            Log($"WebSocket exception ({context}): {ex.GetType().Name}: {ex.Message}\n{ex.StackTrace}");
         }
 
         public static void LogBeforeTest(string testName, bool isSuite, string parent)

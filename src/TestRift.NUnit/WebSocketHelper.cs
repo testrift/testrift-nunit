@@ -24,9 +24,12 @@ namespace TestRift.NUnit
         private bool _disposed = false;
         private readonly SemaphoreSlim _flushSemaphore = new SemaphoreSlim(1, 1);
         private volatile bool _isFlushing = false;
+        private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1, 1);
+        private readonly ConcurrentDictionary<string, SemaphoreSlim> _testCaseSendLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
         private readonly HttpClient _httpClient;
         private CancellationTokenSource _receiveLoopCts;
         private Task _receiveLoopTask;
+        private long _messageSequence;
         // Tracks test cases that have reported unexpected/unhandled errors (is_error = true)
         // so we can map their final status to "error" instead of "failed".
         private readonly ConcurrentDictionary<string, bool> _testCasesWithErrors = new ConcurrentDictionary<string, bool>();
@@ -70,10 +73,11 @@ namespace TestRift.NUnit
 
                 // Debug: Write to file instead of console
                 ThreadSafeFileLogger.LogWebSocketConnected(uri.ToString());
+                ThreadSafeFileLogger.LogWebSocketStateDetails("Post-connect", _webSocket.State, _webSocket.CloseStatus, _webSocket.CloseStatusDescription);
             }
             catch (Exception ex)
             {
-                // Debug: Write error to file
+                ThreadSafeFileLogger.LogWebSocketException("ConnectAsync", ex);
                 ThreadSafeFileLogger.LogWebSocketConnectionFailed(ex.Message);
             }
         }
@@ -140,9 +144,10 @@ namespace TestRift.NUnit
             {
                 if (_webSocket?.State != WebSocketState.Open)
                 {
-                    var state = _webSocket?.State.ToString() ?? "null";
-                    ThreadSafeFileLogger.LogWebSocketNotOpen(state);
-                    throw new InvalidOperationException($"WebSocket connection is not open (state: {state})");
+                    var stateSnapshot = DescribeSocketState();
+                    ThreadSafeFileLogger.LogWebSocketNotOpen(stateSnapshot);
+                    ThreadSafeFileLogger.LogWebSocketStateDetails("wait_run_started", _webSocket?.State, _webSocket?.CloseStatus, _webSocket?.CloseStatusDescription);
+                    throw new InvalidOperationException($"WebSocket connection is not open (state: {stateSnapshot})");
                 }
 
                 var buffer = new byte[4096];
@@ -198,6 +203,7 @@ namespace TestRift.NUnit
             _receiveLoopCts?.Dispose();
 
             _receiveLoopCts = new CancellationTokenSource();
+            ThreadSafeFileLogger.Log("Passive receive loop starting");
             _receiveLoopTask = Task.Run(() => PassiveReceiveLoopAsync(_receiveLoopCts.Token));
         }
 
@@ -219,7 +225,8 @@ namespace TestRift.NUnit
 
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Server closed WebSocket: {_webSocket.CloseStatus} {_webSocket.CloseStatusDescription}");
+                        ThreadSafeFileLogger.LogWebSocketStateDetails("Server close frame", result.CloseStatus.HasValue ? WebSocketState.CloseSent : _webSocket?.State, result.CloseStatus, result.CloseStatusDescription);
+                        ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Server closed WebSocket: {result.CloseStatus} {result.CloseStatusDescription}");
                         await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
                         break;
                     }
@@ -227,20 +234,27 @@ namespace TestRift.NUnit
                     if (result.MessageType == WebSocketMessageType.Text && result.Count > 0)
                     {
                         var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        ThreadSafeFileLogger.Log($"Received server message: {message}");
+                        var snippet = message.Length > 200 ? message.Substring(0, 200) + "..." : message;
+                        ThreadSafeFileLogger.Log($"Received server message ({result.Count} bytes): {snippet}");
                     }
                 }
                 catch (OperationCanceledException)
                 {
+                    ThreadSafeFileLogger.Log("Passive receive loop canceled");
                     break;
                 }
                 catch (ObjectDisposedException)
                 {
+                    ThreadSafeFileLogger.Log("Passive receive loop disposed socket");
                     break;
                 }
                 catch (Exception ex)
                 {
-                    ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Passive receive loop error: {ex.Message}");
+                    ThreadSafeFileLogger.LogWebSocketException("Passive receive loop", ex);
+                    if (ex is WebSocketException wsEx)
+                    {
+                        ThreadSafeFileLogger.LogWebSocketStateDetails($"Passive receive loop fault (code={wsEx.WebSocketErrorCode})", _webSocket?.State, _webSocket?.CloseStatus, _webSocket?.CloseStatusDescription);
+                    }
                     await Task.Delay(1000, token);
                 }
             }
@@ -255,6 +269,7 @@ namespace TestRift.NUnit
 
             try
             {
+                ThreadSafeFileLogger.Log("Stopping passive receive loop");
                 _receiveLoopCts.Cancel();
                 _receiveLoopTask?.Wait(TimeSpan.FromSeconds(5));
             }
@@ -264,6 +279,7 @@ namespace TestRift.NUnit
             }
             finally
             {
+                ThreadSafeFileLogger.Log("Passive receive loop stopped");
                 _receiveLoopCts.Dispose();
                 _receiveLoopCts = null;
                 _receiveLoopTask = null;
@@ -554,7 +570,20 @@ namespace TestRift.NUnit
             // Send immediately if we have a specific test case ID
             if (!string.IsNullOrEmpty(testCaseId))
             {
-                _ = Task.Run(async () => await SendLogBatch(testCaseId));
+                // Use a per-test-case lock to ensure messages are sent in order
+                var sendLock = _testCaseSendLocks.GetOrAdd(testCaseId, _ => new SemaphoreSlim(1, 1));
+                _ = Task.Run(async () =>
+                {
+                    await sendLock.WaitAsync();
+                    try
+                    {
+                        await SendLogBatch(testCaseId);
+                    }
+                    finally
+                    {
+                        sendLock.Release();
+                    }
+                });
             }
         }
 
@@ -610,25 +639,56 @@ namespace TestRift.NUnit
 
         private async Task SendWebSocketMessage(object data)
         {
+            var messageType = GetMessageType(data);
+            var messageId = Interlocked.Increment(ref _messageSequence);
+
+            if (_webSocket?.State != WebSocketState.Open)
+            {
+                var stateSnapshot = DescribeSocketState();
+                ThreadSafeFileLogger.LogWebSocketNotOpen(stateSnapshot);
+                ThreadSafeFileLogger.LogSendFailed($"Send[{messageId}] skipped (type={messageType})");
+                return;
+            }
+
+            string json;
+            byte[] bytes;
             try
             {
+                json = JsonSerializer.Serialize(data);
+                bytes = Encoding.UTF8.GetBytes(json);
+            }
+            catch (Exception ex)
+            {
+                ThreadSafeFileLogger.LogWebSocketException($"Serialize message {messageId} ({messageType})", ex);
+                return;
+            }
+
+            ThreadSafeFileLogger.LogSendStarting(messageId, messageType, DescribeSocketState());
+
+            await _sendSemaphore.WaitAsync();
+            try
+            {
+                // Double-check state after acquiring lock
                 if (_webSocket?.State != WebSocketState.Open)
                 {
-                    ThreadSafeFileLogger.LogWebSocketNotOpen(_webSocket?.State.ToString() ?? "null");
+                    ThreadSafeFileLogger.LogWebSocketNotOpen(DescribeSocketState());
+                    ThreadSafeFileLogger.LogSendFailed($"Send[{messageId}] skipped after lock (type={messageType})");
                     return;
                 }
 
-                var json = JsonSerializer.Serialize(data);
-                var bytes = Encoding.UTF8.GetBytes(json);
                 await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
-
-                // Debug: Log successful send
+                ThreadSafeFileLogger.LogSendCompleted(messageId, messageType, bytes.Length);
                 ThreadSafeFileLogger.LogMessageSent(json.Substring(0, Math.Min(100, json.Length)) + "...");
             }
             catch (Exception ex)
             {
-                // Debug: Write error to file
                 ThreadSafeFileLogger.LogSendFailed(ex.Message);
+                ThreadSafeFileLogger.LogWebSocketException($"Send[{messageId}] ({messageType})", ex);
+                ThreadSafeFileLogger.LogWebSocketStateDetails($"Send[{messageId}] failure", _webSocket?.State, _webSocket?.CloseStatus, _webSocket?.CloseStatusDescription);
+            }
+            finally
+            {
+                _sendSemaphore.Release();
             }
         }
 
@@ -834,11 +894,62 @@ namespace TestRift.NUnit
             {
                 StopPassiveReceiveLoop();
                 _batchTimer?.Dispose();
+                ThreadSafeFileLogger.Log("Disposing WebSocketHelper");
+                if (_webSocket != null)
+                {
+                    ThreadSafeFileLogger.LogWebSocketStateDetails("Dispose", _webSocket.State, _webSocket.CloseStatus, _webSocket.CloseStatusDescription);
+                }
                 _webSocket?.Dispose();
                 _httpClient?.Dispose();
                 _flushSemaphore?.Dispose();
+                _sendSemaphore?.Dispose();
+
+                // Dispose all per-test-case locks
+                foreach (var kvp in _testCaseSendLocks)
+                {
+                    kvp.Value?.Dispose();
+                }
+                _testCaseSendLocks.Clear();
+
                 _disposed = true;
             }
+        }
+
+        private static string GetMessageType(object data)
+        {
+            if (data == null)
+            {
+                return "null";
+            }
+
+            if (data is IDictionary<string, object> dict && dict.TryGetValue("type", out var value) && value != null)
+            {
+                return value.ToString();
+            }
+
+            var typeProperty = data.GetType().GetProperty("type");
+            if (typeProperty != null)
+            {
+                var propertyValue = typeProperty.GetValue(data);
+                if (propertyValue != null)
+                {
+                    return propertyValue.ToString();
+                }
+            }
+
+            return "unknown";
+        }
+
+        private string DescribeSocketState()
+        {
+            if (_webSocket == null)
+            {
+                return "null";
+            }
+
+            var closeStatus = _webSocket.CloseStatus?.ToString() ?? "null";
+            var closeDescription = _webSocket.CloseStatusDescription ?? "null";
+            return $"State={_webSocket.State}, CloseStatus={closeStatus}, CloseDescription={closeDescription}";
         }
     }
 }
