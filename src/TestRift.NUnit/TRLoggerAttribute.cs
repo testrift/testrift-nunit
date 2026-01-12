@@ -1,6 +1,7 @@
 using System;
 using System.Collections.Generic;
 using System.IO;
+using System.Text;
 using System.Threading.Tasks;
 using NUnit.Framework;
 using NUnit.Framework.Interfaces;
@@ -55,10 +56,12 @@ namespace TestRift.NUnit
                 }
 
                 // Now create LogTextWriter and start logging
-                _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"{test.FullName}.log");
+                string testCaseId = GenerateTestCaseId(test.FullName);
+                string safeFileName = MakeSafeFileName(test.FullName);
+                _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"{safeFileName}.log");
                 if (File.Exists(_logFilePath)) File.Delete(_logFilePath);
 
-                _fileWriter = new LogTextWriter(_logFilePath, testCaseId: GenerateTestCaseId(test.FullName), webSocketHelper: _webSocketHelper);
+                _fileWriter = new LogTextWriter(_logFilePath, testCaseId: testCaseId, webSocketHelper: _webSocketHelper);
                 _originalConsole = Console.Out;
                 Console.SetOut(_fileWriter);
 
@@ -130,8 +133,23 @@ namespace TestRift.NUnit
 
         private string GenerateTestCaseId(string fullName)
         {
+            if (string.IsNullOrEmpty(fullName)) return "test";
+
             // Keep dots for proper tree structure, only replace spaces and parentheses
             return fullName.Replace(" ", "_").Replace("(", "").Replace(")", "");
+        }
+
+        private string MakeSafeFileName(string name)
+        {
+            if (string.IsNullOrEmpty(name)) return "test";
+
+            var invalid = Path.GetInvalidFileNameChars();
+            var builder = new System.Text.StringBuilder(name.Length);
+            foreach (var c in name)
+            {
+                builder.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
+            }
+            return builder.Length > 0 ? builder.ToString() : "test";
         }
 
 
