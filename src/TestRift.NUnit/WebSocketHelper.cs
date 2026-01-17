@@ -33,6 +33,10 @@ namespace TestRift.NUnit
         // Tracks test cases that have reported unexpected/unhandled errors (is_error = true)
         // so we can map their final status to "error" instead of "failed".
         private readonly ConcurrentDictionary<string, bool> _testCasesWithErrors = new ConcurrentDictionary<string, bool>();
+        // Counter for generating tc_id (8-char hex)
+        private int _testCaseCounter = 0;
+        // Maps tc_full_name to tc_id
+        private readonly ConcurrentDictionary<string, string> _testCaseIds = new ConcurrentDictionary<string, string>();
 
         public WebSocketHelper(string serverBaseUrl = null)
         {
@@ -402,14 +406,19 @@ namespace TestRift.NUnit
             await SendWebSocketMessage(data);
         }
 
-        public async Task SendTestCaseStarted(string testCaseId, string fullName, string startTime = null)
+        public async Task SendTestCaseStarted(string tcFullName, string startTime = null)
         {
+            // Generate tc_id for this test case (8-char hex, zero-padded)
+            var tcId = Interlocked.Increment(ref _testCaseCounter).ToString("x8");
+            _testCaseIds[tcFullName] = tcId;
+
             var data = new
             {
                 type = "test_case_started",
                 run_id = _runId,
-                test_case_id = testCaseId,
-                test_case_meta = new
+                tc_full_name = tcFullName,
+                tc_id = tcId,
+                tc_meta = new
                 {
                     status = "running",
                     start_time = startTime ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
@@ -427,12 +436,19 @@ namespace TestRift.NUnit
             // Convert NUnit result + any recorded error flag to standardized status format
             string standardizedStatus = ConvertNUnitResultAndErrorFlagToStatus(result, testCaseId);
 
+            // Lookup the tc_id for this test case
+            if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+            {
+                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                return;
+            }
+
             // Then send the test case finished message
             var data = new
             {
                 type = "test_case_finished",
                 run_id = _runId,
-                test_case_id = testCaseId,
+                tc_id = tcId,
                 status = standardizedStatus
             };
 
@@ -497,6 +513,13 @@ namespace TestRift.NUnit
                 _testCasesWithErrors[testCaseId] = true;
             }
 
+            // Lookup the tc_id for this test case
+            if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+            {
+                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                return Task.CompletedTask;
+            }
+
             // Normalize the stack trace into a list of lines. This becomes the canonical representation.
             var normalizedLines = lines != null
                 ? new List<string>(lines)
@@ -506,7 +529,7 @@ namespace TestRift.NUnit
             {
                 type = "exception",
                 run_id = _runId,
-                test_case_id = testCaseId,
+                tc_id = tcId,
                 timestamp = timestamp ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
                 message,
                 exception_type = exceptionType,
@@ -629,7 +652,7 @@ namespace TestRift.NUnit
                 {
                     type = "log_batch",
                     run_id = _runId,
-                    test_case_id = testCaseId,
+                    tc_full_name = testCaseId,
                     entries = messages
                 };
 
@@ -696,6 +719,13 @@ namespace TestRift.NUnit
         {
             if (_messageQueue.IsEmpty) return;
 
+            // Lookup the tc_id for this test case
+            if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+            {
+                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                return;
+            }
+
             var messages = new List<LogEntry>();
             var remainingMessages = new List<LogEntry>();
 
@@ -724,7 +754,7 @@ namespace TestRift.NUnit
             {
                 type = "log_batch",
                 run_id = _runId,
-                test_case_id = testCaseId,
+                tc_id = tcId,
                 entries = messages
             };
 
@@ -844,8 +874,15 @@ namespace TestRift.NUnit
                     return false;
                 }
 
+                // Lookup the tc_id for this test case
+                if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+                {
+                    ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                    return false;
+                }
+
                 var fileName = Path.GetFileName(filePath);
-                var uploadUrl = $"{_serverBaseUrl}/api/attachments/{_runId}/{testCaseId}/upload";
+                var uploadUrl = $"{_serverBaseUrl}/api/attachments/{_runId}/{tcId}/upload";
 
                 using (var form = new MultipartFormDataContent())
                 using (var fileContent = new ByteArrayContent(await ReadAllBytesAsync(filePath)))

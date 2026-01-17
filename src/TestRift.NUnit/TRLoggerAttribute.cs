@@ -50,7 +50,6 @@ namespace TestRift.NUnit
                 if (_webSocketHelper != null)
                 {
                     _webSocketHelper.SendTestCaseStarted(
-                        GenerateTestCaseId(test.FullName),
                         test.FullName,
                         DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")).Wait();
                 }
