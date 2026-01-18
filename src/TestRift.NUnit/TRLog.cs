@@ -55,17 +55,17 @@ namespace TestRift.NUnit
             var webSocketHelper = TestContextWrapper.GetWebSocketHelper();
             if (webSocketHelper == null) return;
 
-            var testCaseId = GetCurrentTestCaseId();
+            var nunitTestId = GetCurrentTestCaseId();
             var dirString = dir.HasValue ? (dir.Value == Direction.Tx ? "tx" : "rx") : null;
             var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
             var phase = TeardownMonitor.OnActivity(
-                testCaseId,
+                nunitTestId,
                 webSocketHelper,
                 activity: "TRLog.Log",
                 aboutToSendLog: true,
                 timestamp: timestamp);
 
-            webSocketHelper.QueueLogMessage(message, component, channel, dirString, testCaseId, timestamp, phase);
+            webSocketHelper.QueueLogMessage(message, component, channel, dirString, nunitTestId, timestamp, phase);
         }
 
         /// <summary>
@@ -100,7 +100,8 @@ namespace TestRift.NUnit
         {
             try
             {
-                return TestContext.CurrentContext?.Test?.FullName?.Replace(" ", "_").Replace("(", "").Replace(")", "") ?? null;
+                // Use NUnit test.ID for reliable lookup even when tests run concurrently (TestAdapter uses ID, not Id)
+                return TestContext.CurrentContext?.Test?.ID ?? null;
             }
             catch
             {

@@ -44,12 +44,12 @@ namespace TestRift.NUnit
             {
                 foreach (var attachment in pendingAttachments)
                 {
-                    // Keep dots for proper tree structure, only replace spaces and parentheses
-                    var testCaseId = TestContext.CurrentContext.Test.FullName.Replace(" ", "_").Replace("(", "").Replace(")", "");
+                    // Use NUnit test.ID for reliable lookup (TestAdapter uses ID, not Id)
+                    var nunitTestId = TestContext.CurrentContext.Test.ID;
 
                     lock (_lock)
                     {
-                        var uploadTask = _webSocketHelper.UploadAttachmentAsync(testCaseId, attachment.FilePath, attachment.Description);
+                        var uploadTask = _webSocketHelper.UploadAttachmentAsync(nunitTestId, attachment.FilePath, attachment.Description);
                         _pendingUploads.Add(uploadTask);
                     }
                 }
@@ -67,12 +67,12 @@ namespace TestRift.NUnit
             // Start upload immediately if WebSocket helper is available
             if (_webSocketHelper != null)
             {
-                // Keep dots for proper tree structure, only replace spaces and parentheses
-                var testCaseId = TestContext.CurrentContext.Test.FullName.Replace(" ", "_").Replace("(", "").Replace(")", "");
+                // Use NUnit test.ID for reliable lookup (TestAdapter uses ID, not Id)
+                var nunitTestId = TestContext.CurrentContext.Test.ID;
 
                 lock (_lock)
                 {
-                    var uploadTask = _webSocketHelper.UploadAttachmentAsync(testCaseId, filePath, description);
+                    var uploadTask = _webSocketHelper.UploadAttachmentAsync(nunitTestId, filePath, description);
                     _pendingUploads.Add(uploadTask);
                 }
             }
@@ -122,12 +122,12 @@ namespace TestRift.NUnit
                 return Task.CompletedTask;
             }
 
-            // Keep dots for proper tree structure, only replace spaces and parentheses
-            var testCaseId = TestContext.CurrentContext.Test.FullName.Replace(" ", "_").Replace("(", "").Replace(")", "");
+            // Use NUnit test.ID for reliable lookup (TestAdapter uses ID, not Id)
+            var nunitTestId = TestContext.CurrentContext.Test.ID;
 
             lock (_lock)
             {
-                var task = _webSocketHelper.SendExceptionAsync(testCaseId, message, stackTrace, exceptionType, null, isError);
+                var task = _webSocketHelper.SendExceptionAsync(nunitTestId, message, stackTrace, exceptionType, null, isError);
                 _pendingUploads.Add(task);
                 return task;
             }

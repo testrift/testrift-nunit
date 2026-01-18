@@ -1,27 +1,21 @@
 using System;
-using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using NUnit.Framework;
 
 namespace TestRift.NUnit
 {
     /// <summary>
-    /// Enhanced TextWriter that captures console output and sends it via WebSocket
+    /// TextWriter that captures console output and routes it to WebSocketHelper
     /// </summary>
     public class LogTextWriter : TextWriter
     {
-        private readonly string _filePath;
-        private readonly object _lock = new object();
-        private readonly string _testCaseId;
         private readonly WebSocketHelper _webSocketHelper;
         private readonly StringBuilder _buffer = new StringBuilder();
-        private readonly List<LogEntry> _pendingMessages = new List<LogEntry>();
         private DateTime _lineStartTime;
 
-        public LogTextWriter(string filePath, string testCaseId = null, WebSocketHelper webSocketHelper = null)
+        public LogTextWriter(WebSocketHelper webSocketHelper = null)
         {
-            _filePath = filePath;
-            _testCaseId = testCaseId;
             _webSocketHelper = webSocketHelper;
         }
 
@@ -29,10 +23,8 @@ namespace TestRift.NUnit
 
         public override void Write(char value)
         {
-            lock (_lock)
+            lock (_buffer)
             {
-                File.AppendAllText(_filePath, value.ToString());
-
                 // If starting a new line, capture timestamp
                 if (_buffer.Length == 0)
                 {
@@ -53,10 +45,8 @@ namespace TestRift.NUnit
         {
             if (string.IsNullOrEmpty(value)) return;
 
-            lock (_lock)
+            lock (_buffer)
             {
-                File.AppendAllText(_filePath, value);
-
                 // If starting a new line, capture timestamp
                 if (_buffer.Length == 0)
                 {
@@ -75,10 +65,8 @@ namespace TestRift.NUnit
 
         public override void WriteLine(string value)
         {
-            lock (_lock)
+            lock (_buffer)
             {
-                File.AppendAllText(_filePath, value + Environment.NewLine);
-
                 // If starting a new line, capture timestamp
                 if (_buffer.Length == 0)
                 {
@@ -92,7 +80,7 @@ namespace TestRift.NUnit
 
         public override void Flush()
         {
-            lock (_lock)
+            lock (_buffer)
             {
                 FlushBuffer();
             }
@@ -100,82 +88,58 @@ namespace TestRift.NUnit
 
         private void FlushBuffer()
         {
-            if (_buffer.Length > 0)
+            if (_buffer.Length == 0 || _webSocketHelper == null)
             {
-                var message = _buffer.ToString().TrimEnd('\r', '\n');
-
-                if (!string.IsNullOrEmpty(message))
-                {
-                    var phase = TeardownMonitor.OnActivity(
-                        _testCaseId,
-                        _webSocketHelper,
-                        activity: "LogTextWriter.FlushBuffer",
-                        aboutToSendLog: true,
-                        timestamp: _lineStartTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"));
-
-                    // Create LogEntry with timestamp when message was first written
-                    var logEntry = new LogEntry
-                    {
-                        timestamp = _lineStartTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
-                        message = message,
-                        component = Environment.MachineName,
-                        channel = "console",
-                        dir = null, // Console messages don't have direction
-                        testCaseId = _testCaseId,
-                        phase = phase
-                    };
-
-                    _pendingMessages.Add(logEntry);
-                }
-                _buffer.Clear();
+                return;
             }
 
-            // Send all pending messages
-            if (_pendingMessages.Count > 0)
+            var message = _buffer.ToString().TrimEnd('\r', '\n');
+            _buffer.Clear();
+
+            if (string.IsNullOrEmpty(message))
             {
-                SendPendingMessages();
+                return;
             }
+
+            // Get current test ID from TestContext
+            string nunitTestId = GetCurrentTestId();
+            if (string.IsNullOrEmpty(nunitTestId))
+            {
+                return;
+            }
+
+            // Get phase from TeardownMonitor
+            string phase = TeardownMonitor.OnActivity(
+                nunitTestId,
+                _webSocketHelper,
+                activity: "LogTextWriter.FlushBuffer",
+                aboutToSendLog: true,
+                timestamp: _lineStartTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"));
+
+            // Queue the message - WebSocketHelper will handle buffering per test case
+            _webSocketHelper.QueueLogMessage(
+                message,
+                Environment.MachineName,
+                "console",
+                null, // No direction for console messages
+                nunitTestId,
+                _lineStartTime.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
+                phase);
         }
 
-        private void SendPendingMessages()
+        /// <summary>
+        /// Gets the current test ID from TestContext
+        /// </summary>
+        private string GetCurrentTestId()
         {
-            if (_webSocketHelper != null && _pendingMessages.Count > 0)
+            try
             {
-                // Send all pending messages at once using the new API
-                foreach (var logEntry in _pendingMessages)
-                {
-                    _webSocketHelper.QueueLogMessage(
-                        logEntry.message,
-                        logEntry.component,
-                        logEntry.channel,
-                        logEntry.dir,
-                        logEntry.testCaseId,
-                        logEntry.timestamp,
-                        logEntry.phase);
-                }
-                _pendingMessages.Clear();
+                return TestContext.CurrentContext?.Test?.ID;
+            }
+            catch
+            {
+                return null;
             }
         }
-
-
-        public new void Dispose()
-        {
-            lock (_lock)
-            {
-                FlushBuffer(); // Flush any remaining content
-            }
-        }
-    }
-
-    public class LogEntry
-    {
-        public string timestamp { get; set; }
-        public string message { get; set; }
-        public string component { get; set; }
-        public string channel { get; set; }
-        public string dir { get; set; }
-        public string testCaseId { get; set; }
-        // Optional execution phase marker. When present, UI can use it for grouping (e.g. teardown).
-        public string phase { get; set; }
     }
 }

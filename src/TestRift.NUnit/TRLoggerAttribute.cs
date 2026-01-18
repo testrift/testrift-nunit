@@ -19,13 +19,13 @@ namespace TestRift.NUnit
     [AttributeUsage(AttributeTargets.Method | AttributeTargets.Class | AttributeTargets.Assembly, AllowMultiple = false)]
     public class TRLoggerAttribute : Attribute, ITestAction
     {
-        private TextWriter _originalConsole;
-        private LogTextWriter _fileWriter;
-        private string _logFilePath;
         private WebSocketHelper _webSocketHelper;
         private static WebSocketHelper _sharedWebSocketHelper;
         private static bool _runStarted = false;
         private static readonly object _runLock = new object();
+        // Static console writer - created once per run, shared across all test instances
+        private static TextWriter _originalConsole;
+        private static LogTextWriter _logWriter;
         public void BeforeTest(ITest test)
         {
             ThreadSafeFileLogger.LogBeforeTest(test.FullName, test.IsSuite, test.Parent?.FullName);
@@ -47,28 +47,28 @@ namespace TestRift.NUnit
                 TestContextWrapper.SetWebSocketHelper(_webSocketHelper);
 
                 // Send test case started FIRST, synchronously
+                // Use test.FullName for the WebSocket message and test.Id for reliable lookup
+                string nunitTestId = test.Id;
                 if (_webSocketHelper != null)
                 {
                     _webSocketHelper.SendTestCaseStarted(
                         test.FullName,
+                        nunitTestId,
                         DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")).Wait();
                 }
 
-                // Now create LogTextWriter and start logging
-                string testCaseId = GenerateTestCaseId(test.FullName);
-                string safeFileName = MakeSafeFileName(test.FullName);
-                _logFilePath = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, $"{safeFileName}.log");
-                if (File.Exists(_logFilePath)) File.Delete(_logFilePath);
-
-                _fileWriter = new LogTextWriter(_logFilePath, testCaseId: testCaseId, webSocketHelper: _webSocketHelper);
-                _originalConsole = Console.Out;
-                Console.SetOut(_fileWriter);
-
-                _fileWriter.WriteLine($"[START] {test.FullName}");
+                // Write test start marker using the shared log writer (created once per run)
+                lock (_runLock)
+                {
+                    if (_logWriter != null)
+                    {
+                        _logWriter.WriteLine($"[START] {test.FullName}");
+                    }
+                }
 
                 // Activity hook (does not emit teardown marker here)
                 TeardownMonitor.OnActivity(
-                    GenerateTestCaseId(test.FullName),
+                    test.Id,
                     _webSocketHelper,
                     activity: "TRLoggerAttribute.BeforeTest",
                     aboutToSendLog: false);
@@ -85,24 +85,19 @@ namespace TestRift.NUnit
                 // Ensure stack trace is reported only once BEFORE we emit teardown-phase console lines.
                 // (The UI's teardown grouping is order-based, so exceptions must be emitted first.)
                 var exceptionTimestamp = DateTime.UtcNow.AddMilliseconds(-5).ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
-                TeardownMonitor.OnAfterTest(GenerateTestCaseId(test.FullName), _webSocketHelper, exceptionTimestamp);
+                TeardownMonitor.OnAfterTest(test.Id, _webSocketHelper, exceptionTimestamp);
 
-                _fileWriter?.WriteLine($"[END] {test.FullName} => {TestContext.CurrentContext.Result.Outcome}");
-                _fileWriter?.Dispose();
-                _fileWriter = null;
-
-                if (_originalConsole != null)
+                // Write test end marker using the shared log writer (created once per run)
+                lock (_runLock)
                 {
-                    Console.SetOut(_originalConsole);
-                    _originalConsole = null;
-                }
-                else
-                {
-                    ThreadSafeFileLogger.Log($"[WARN] Original console writer missing when ending {test.FullName}; skipping Console.SetOut");
+                    if (_logWriter != null)
+                    {
+                        _logWriter.WriteLine($"[END] {test.FullName} => {TestContext.CurrentContext.Result.Outcome}");
+                    }
                 }
 
                 TeardownMonitor.OnActivity(
-                    GenerateTestCaseId(test.FullName),
+                    test.Id,
                     _webSocketHelper,
                     activity: "TRLoggerAttribute.AfterTest",
                     aboutToSendLog: false);
@@ -116,13 +111,14 @@ namespace TestRift.NUnit
                 // Wait for all uploads to complete before leaving AfterTest
                 TestContextWrapper.WaitForUploadsToComplete();
 
-                // Send test case finished
+                // Send test case finished (use NUnit test.Id for reliable lookup)
+                // SendTestCaseFinished will flush any remaining queued messages before sending the finished message
                 if (_webSocketHelper != null)
                 {
                     _ = Task.Run(async () =>
                     {
                         await _webSocketHelper.SendTestCaseFinished(
-                            GenerateTestCaseId(test.FullName),
+                            test.Id,
                             TestContext.CurrentContext.Result.Outcome.ToString());
                     });
                 }
@@ -138,18 +134,6 @@ namespace TestRift.NUnit
             return fullName.Replace(" ", "_").Replace("(", "").Replace(")", "");
         }
 
-        private string MakeSafeFileName(string name)
-        {
-            if (string.IsNullOrEmpty(name)) return "test";
-
-            var invalid = Path.GetInvalidFileNameChars();
-            var builder = new System.Text.StringBuilder(name.Length);
-            foreach (var c in name)
-            {
-                builder.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
-            }
-            return builder.Length > 0 ? builder.ToString() : "test";
-        }
 
 
 
@@ -162,7 +146,8 @@ namespace TestRift.NUnit
 
                 if (attachments.Count > 0)
                 {
-                    var testCaseId = GenerateTestCaseId(test.FullName);
+                    // Use NUnit test.Id for reliable lookup
+                    var nunitTestId = test.Id;
 
                     // Upload each attachment asynchronously
                     foreach (var attachment in attachments)
@@ -172,7 +157,7 @@ namespace TestRift.NUnit
                             try
                             {
                                 await _webSocketHelper.UploadAttachmentAsync(
-                                    testCaseId,
+                                    nunitTestId,
                                     attachment.FilePath,
                                     attachment.Description);
                             }
@@ -218,6 +203,12 @@ namespace TestRift.NUnit
                     }
 
                     ThreadSafeFileLogger.LogRunStarted();
+
+                    // Create LogTextWriter once per run (shared across all test instances)
+                    // This hooks Console.SetOut globally for the entire test run
+                    _originalConsole = Console.Out;
+                    _logWriter = new LogTextWriter(_sharedWebSocketHelper);
+                    Console.SetOut(_logWriter);
                 }
             }
         }
@@ -250,6 +241,19 @@ namespace TestRift.NUnit
                     }
                     finally
                     {
+                        // Restore original console writer and dispose log writer
+                        if (_logWriter != null)
+                        {
+                            _logWriter.Flush();
+                            _logWriter.Dispose();
+                            _logWriter = null;
+                        }
+                        if (_originalConsole != null)
+                        {
+                            Console.SetOut(_originalConsole);
+                            _originalConsole = null;
+                        }
+
                         // Always clean up resources
                         _sharedWebSocketHelper.Dispose();
                         _sharedWebSocketHelper = null;

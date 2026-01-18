@@ -6,6 +6,7 @@ using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
 
@@ -37,6 +38,8 @@ namespace TestRift.NUnit
         private int _testCaseCounter = 0;
         // Maps tc_full_name to tc_id
         private readonly ConcurrentDictionary<string, string> _testCaseIds = new ConcurrentDictionary<string, string>();
+        // Maps NUnit test.Id to tc_id (for concurrent test execution)
+        private readonly ConcurrentDictionary<string, string> _testIdToTcId = new ConcurrentDictionary<string, string>();
 
         public WebSocketHelper(string serverBaseUrl = null)
         {
@@ -406,11 +409,18 @@ namespace TestRift.NUnit
             await SendWebSocketMessage(data);
         }
 
-        public async Task SendTestCaseStarted(string tcFullName, string startTime = null)
+        public async Task SendTestCaseStarted(string tcFullName, string nunitTestId, string startTime = null)
         {
-            // Generate tc_id for this test case (8-char hex, zero-padded)
-            var tcId = Interlocked.Increment(ref _testCaseCounter).ToString("x8");
+            // Use NUnit test ID as tc_id directly (no need to generate a separate ID)
+            // This simplifies the code and makes it more reliable for concurrent tests
+            var tcId = nunitTestId;
+
+            // Register mapping for lookup (keep for backward compatibility if needed)
             _testCaseIds[tcFullName] = tcId;
+            if (!string.IsNullOrEmpty(nunitTestId))
+            {
+                _testIdToTcId[nunitTestId] = tcId;
+            }
 
             var data = new
             {
@@ -425,21 +435,39 @@ namespace TestRift.NUnit
                 }
             };
 
+            // Send the message and wait for it to complete
             await SendWebSocketMessage(data);
         }
 
-        public async Task SendTestCaseFinished(string testCaseId, string result)
+        /// <summary>
+        /// Get tc_id from NUnit test.Id (for concurrent test execution)
+        /// </summary>
+        public string GetTcIdFromTestId(string nunitTestId)
+        {
+            return _testIdToTcId.TryGetValue(nunitTestId, out var tcId) ? tcId : null;
+        }
+
+        /// <summary>
+        /// Get tc_id from test case full name
+        /// </summary>
+        public string GetTcIdFromFullName(string tcFullName)
+        {
+            return _testCaseIds.TryGetValue(tcFullName, out var tcId) ? tcId : null;
+        }
+
+        public async Task SendTestCaseFinished(string nunitTestId, string result)
         {
             // First, flush all queued messages for this test case to ensure proper ordering
-            await FlushMessagesForTestCase(testCaseId);
+            await FlushMessagesForTestCase(nunitTestId);
 
             // Convert NUnit result + any recorded error flag to standardized status format
-            string standardizedStatus = ConvertNUnitResultAndErrorFlagToStatus(result, testCaseId);
+            string standardizedStatus = ConvertNUnitResultAndErrorFlagToStatus(result, nunitTestId);
 
-            // Lookup the tc_id for this test case
-            if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+            // Use NUnit test ID directly as tc_id
+            string tcId = nunitTestId;
+            if (string.IsNullOrEmpty(tcId))
             {
-                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty for test case");
                 return;
             }
 
@@ -460,11 +488,11 @@ namespace TestRift.NUnit
         /// - If the test case has reported an unexpected/unhandled error (is_error = true), return "error".
         /// - Otherwise, map NUnit result to "passed" / "failed" / "skipped".
         /// </summary>
-        private string ConvertNUnitResultAndErrorFlagToStatus(string nunitResult, string testCaseId)
+        private string ConvertNUnitResultAndErrorFlagToStatus(string nunitResult, string nunitTestId)
         {
             // If we saw an is_error=true exception for this test case, treat it as "error"
-            if (!string.IsNullOrWhiteSpace(testCaseId) &&
-                _testCasesWithErrors.TryGetValue(testCaseId, out var hasError) &&
+            if (!string.IsNullOrWhiteSpace(nunitTestId) &&
+                _testCasesWithErrors.TryGetValue(nunitTestId, out var hasError) &&
                 hasError)
             {
                 return "error";
@@ -493,7 +521,7 @@ namespace TestRift.NUnit
         }
 
         public Task SendExceptionAsync(
-            string testCaseId,
+            string nunitTestId,
             string message,
             string stackTrace,
             string exceptionType = null,
@@ -501,7 +529,7 @@ namespace TestRift.NUnit
             bool isError = false,
             string timestamp = null)
         {
-            if (string.IsNullOrEmpty(_runId) || string.IsNullOrWhiteSpace(testCaseId) || string.IsNullOrWhiteSpace(stackTrace))
+            if (string.IsNullOrEmpty(_runId) || string.IsNullOrWhiteSpace(nunitTestId) || string.IsNullOrWhiteSpace(stackTrace))
             {
                 return Task.CompletedTask;
             }
@@ -510,13 +538,14 @@ namespace TestRift.NUnit
             // status can be reported as "error" instead of "failed".
             if (isError)
             {
-                _testCasesWithErrors[testCaseId] = true;
+                _testCasesWithErrors[nunitTestId] = true;
             }
 
-            // Lookup the tc_id for this test case
-            if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+            // Use NUnit test ID directly as tc_id
+            string tcId = nunitTestId;
+            if (string.IsNullOrEmpty(tcId))
             {
-                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty for test case");
                 return Task.CompletedTask;
             }
 
@@ -542,7 +571,7 @@ namespace TestRift.NUnit
         }
 
         public void SendException(
-            string testCaseId,
+            string nunitTestId,
             string message,
             string stackTrace,
             string exceptionType = null,
@@ -550,7 +579,7 @@ namespace TestRift.NUnit
             bool isError = false,
             string timestamp = null)
         {
-            _ = SendExceptionAsync(testCaseId, message, stackTrace, exceptionType, lines, isError, timestamp);
+            _ = SendExceptionAsync(nunitTestId, message, stackTrace, exceptionType, lines, isError, timestamp);
         }
 
         public void QueueMessage(string message, string source = "console", string testCaseId = null)
@@ -565,9 +594,9 @@ namespace TestRift.NUnit
         /// <param name="component">The component name</param>
         /// <param name="channel">Optional channel name</param>
         /// <param name="dir">Optional direction: "tx" or "rx"</param>
-        /// <param name="testCaseId">Optional test case ID</param>
+        /// <param name="nunitTestId">Optional NUnit test ID (for concurrent test execution)</param>
         /// <param name="timestamp">Optional timestamp (uses current time if not provided)</param>
-        public void QueueLogMessage(string message, string component, string channel = null, string dir = null, string testCaseId = null, string timestamp = null, string phase = null)
+        public void QueueLogMessage(string message, string component, string channel = null, string dir = null, string nunitTestId = null, string timestamp = null, string phase = null)
         {
             if (string.IsNullOrEmpty(_runId) || string.IsNullOrEmpty(message)) return;
 
@@ -584,23 +613,23 @@ namespace TestRift.NUnit
                 component = component ?? Environment.MachineName,
                 channel = channel,
                 dir = dir,
-                testCaseId = testCaseId,
+                testCaseId = nunitTestId,  // Stores NUnit test ID for lookup
                 phase = phase
             };
 
             _messageQueue.Enqueue(logEntry);
 
             // Send immediately if we have a specific test case ID
-            if (!string.IsNullOrEmpty(testCaseId))
+            if (!string.IsNullOrEmpty(nunitTestId))
             {
                 // Use a per-test-case lock to ensure messages are sent in order
-                var sendLock = _testCaseSendLocks.GetOrAdd(testCaseId, _ => new SemaphoreSlim(1, 1));
+                var sendLock = _testCaseSendLocks.GetOrAdd(nunitTestId, _ => new SemaphoreSlim(1, 1));
                 _ = Task.Run(async () =>
                 {
                     await sendLock.WaitAsync();
                     try
                     {
-                        await SendLogBatch(testCaseId);
+                        await SendLogBatch(nunitTestId);
                     }
                     finally
                     {
@@ -622,6 +651,20 @@ namespace TestRift.NUnit
         private async Task FlushMessagesForTestCase(string testCaseId)
         {
             if (string.IsNullOrEmpty(testCaseId)) return;
+
+            // CRITICAL: Wait for any in-flight SendLogBatch operations to complete
+            // This ensures messages queued by QueueLogMessage are actually sent before we collect remaining messages
+            var sendLock = _testCaseSendLocks.GetOrAdd(testCaseId, _ => new SemaphoreSlim(1, 1));
+            await sendLock.WaitAsync();
+            try
+            {
+                // Give a small moment for any queued SendLogBatch tasks to complete
+                await Task.Delay(10);
+            }
+            finally
+            {
+                sendLock.Release();
+            }
 
             var messages = new List<LogEntry>();
             var remainingMessages = new List<LogEntry>();
@@ -648,11 +691,24 @@ namespace TestRift.NUnit
             // Send all messages for this test case
             if (messages.Count > 0)
             {
+                // Use NUnit test ID directly as tc_id
+                string tcId = testCaseId;
+                if (string.IsNullOrEmpty(tcId))
+                {
+                    ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty in FlushMessagesForTestCase");
+                    // Put messages back in queue
+                    foreach (var message in messages)
+                    {
+                        _messageQueue.Enqueue(message);
+                    }
+                    return;
+                }
+
                 var data = new
                 {
                     type = "log_batch",
                     run_id = _runId,
-                    tc_full_name = testCaseId,
+                    tc_id = tcId,
                     entries = messages
                 };
 
@@ -677,7 +733,12 @@ namespace TestRift.NUnit
             byte[] bytes;
             try
             {
-                json = JsonSerializer.Serialize(data);
+                // Configure serializer to ignore null values
+                var options = new JsonSerializerOptions
+                {
+                    DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
+                };
+                json = JsonSerializer.Serialize(data, options);
                 bytes = Encoding.UTF8.GetBytes(json);
             }
             catch (Exception ex)
@@ -715,14 +776,15 @@ namespace TestRift.NUnit
             }
         }
 
-        private async Task SendLogBatch(string testCaseId)
+        private async Task SendLogBatch(string nunitTestId)
         {
             if (_messageQueue.IsEmpty) return;
 
-            // Lookup the tc_id for this test case
-            if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+            // Use NUnit test ID directly as tc_id
+            string tcId = nunitTestId;
+            if (string.IsNullOrEmpty(tcId))
             {
-                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty for test case");
                 return;
             }
 
@@ -732,7 +794,7 @@ namespace TestRift.NUnit
             // Collect messages for this specific test case
             while (_messageQueue.TryDequeue(out var message))
             {
-                if (message.testCaseId == testCaseId)
+                if (message.testCaseId == nunitTestId)
                 {
                     messages.Add(message);
                 }
@@ -835,9 +897,9 @@ namespace TestRift.NUnit
         /// <summary>
         /// Uploads an attachment for a test case (synchronous version)
         /// </summary>
-        public bool UploadAttachment(string testCaseId, string filePath, string description = null)
+        public bool UploadAttachment(string nunitTestId, string filePath, string description = null)
         {
-            return UploadAttachmentAsync(testCaseId, filePath, description).GetAwaiter().GetResult();
+            return UploadAttachmentAsync(nunitTestId, filePath, description).GetAwaiter().GetResult();
         }
 
         /// <summary>
@@ -864,7 +926,7 @@ namespace TestRift.NUnit
         /// <summary>
         /// Uploads an attachment for a test case
         /// </summary>
-        public async Task<bool> UploadAttachmentAsync(string testCaseId, string filePath, string description = null)
+        public async Task<bool> UploadAttachmentAsync(string nunitTestId, string filePath, string description = null)
         {
             try
             {
@@ -875,9 +937,11 @@ namespace TestRift.NUnit
                 }
 
                 // Lookup the tc_id for this test case
-                if (!_testCaseIds.TryGetValue(testCaseId, out var tcId))
+                // Lookup the tc_id (try NUnit test ID first, then full name)
+                string tcId = GetTcIdFromTestId(nunitTestId) ?? GetTcIdFromFullName(nunitTestId);
+                if (tcId == null)
                 {
-                    ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {testCaseId}");
+                    ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id not found for test case: {nunitTestId}");
                     return false;
                 }
 
@@ -988,5 +1052,21 @@ namespace TestRift.NUnit
             var closeDescription = _webSocket.CloseStatusDescription ?? "null";
             return $"State={_webSocket.State}, CloseStatus={closeStatus}, CloseDescription={closeDescription}";
         }
+    }
+
+    /// <summary>
+    /// Log entry for WebSocket messages. Only includes non-null fields when serialized.
+    /// </summary>
+    public class LogEntry
+    {
+        public string timestamp { get; set; }
+        public string message { get; set; }
+        public string component { get; set; }
+        public string channel { get; set; }
+        public string dir { get; set; }  // Only included if not null
+        public string phase { get; set; }  // Only included if not null
+        // Note: testCaseId is NOT included - it's only used internally for routing
+        [JsonIgnore]
+        public string testCaseId { get; set; }  // Internal use only for routing messages
     }
 }

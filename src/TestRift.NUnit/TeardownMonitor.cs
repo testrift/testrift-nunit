@@ -30,28 +30,28 @@ namespace TestRift.NUnit
             string.Equals(status, "Inconclusive", StringComparison.OrdinalIgnoreCase);
 
 
-        public static string GetPhase(string testCaseId)
+        public static string GetPhase(string nunitTestId)
         {
-            if (string.IsNullOrWhiteSpace(testCaseId)) return null;
-            return _states.TryGetValue(testCaseId, out var st) && st.TeardownStarted ? "teardown" : null;
+            if (string.IsNullOrWhiteSpace(nunitTestId)) return null;
+            return _states.TryGetValue(nunitTestId, out var st) && st.TeardownStarted ? "teardown" : null;
         }
 
         /// <summary>
         /// Call on any activity. Returns the current phase (null or "teardown").
         /// </summary>
         public static string OnActivity(
-            string testCaseId,
+            string nunitTestId,
             WebSocketHelper webSocketHelper,
             string activity,
             bool aboutToSendLog,
             string timestamp = null)
         {
-            if (string.IsNullOrWhiteSpace(testCaseId))
+            if (string.IsNullOrWhiteSpace(nunitTestId))
             {
                 return null;
             }
 
-            var st = _states.GetOrAdd(testCaseId, _ => new State());
+            var st = _states.GetOrAdd(nunitTestId, _ => new State());
 
             // Read current status
             string currentStatus = null;
@@ -105,7 +105,7 @@ namespace TestRift.NUnit
                 }
 
                 TryReportExceptionOnce(
-                    testCaseId,
+                    nunitTestId,
                     st,
                     webSocketHelper,
                     blockUntilSent: willStartTeardown && aboutToSendLog,
@@ -120,15 +120,15 @@ namespace TestRift.NUnit
             return st.TeardownStarted ? "teardown" : null;
         }
 
-        public static void OnAfterTest(string testCaseId, WebSocketHelper webSocketHelper = null, string preferredTimestamp = null)
+        public static void OnAfterTest(string nunitTestId, WebSocketHelper webSocketHelper = null, string preferredTimestamp = null)
         {
-            if (string.IsNullOrWhiteSpace(testCaseId)) return;
-            var st = _states.GetOrAdd(testCaseId, _ => new State());
-            TryReportExceptionOnce(testCaseId, st, webSocketHelper, blockUntilSent: false, preferredTimestamp: preferredTimestamp);
+            if (string.IsNullOrWhiteSpace(nunitTestId)) return;
+            var st = _states.GetOrAdd(nunitTestId, _ => new State());
+            TryReportExceptionOnce(nunitTestId, st, webSocketHelper, blockUntilSent: false, preferredTimestamp: preferredTimestamp);
         }
 
         private static void TryReportExceptionOnce(
-            string testCaseId,
+            string nunitTestId,
             State st,
             WebSocketHelper webSocketHelper,
             bool blockUntilSent,
@@ -155,7 +155,7 @@ namespace TestRift.NUnit
                     if (webSocketHelper != null)
                     {
                         sendTask = webSocketHelper.SendExceptionAsync(
-                            testCaseId,
+                            nunitTestId,
                             testResult.Message,
                             testResult.StackTrace,
                             testResult.Outcome.Status.ToString(),
