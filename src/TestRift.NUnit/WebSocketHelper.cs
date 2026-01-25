@@ -5,13 +5,119 @@ using System.IO;
 using System.Net.Http;
 using System.Net.WebSockets;
 using System.Text;
-using System.Text.Json;
-using System.Text.Json.Serialization;
 using System.Threading;
 using System.Threading.Tasks;
+using MessagePack;
 
 namespace TestRift.NUnit
 {
+    /// <summary>
+    /// Protocol constants for optimized MessagePack wire format.
+    /// See docs/websocket_protocol.md for complete specification.
+    /// </summary>
+    internal static class Protocol
+    {
+        // Message types (t field)
+        public const int MSG_RUN_STARTED = 1;
+        public const int MSG_RUN_STARTED_RESPONSE = 2;
+        public const int MSG_TEST_CASE_STARTED = 3;
+        public const int MSG_LOG_BATCH = 4;
+        public const int MSG_EXCEPTION = 5;
+        public const int MSG_TEST_CASE_FINISHED = 6;
+        public const int MSG_RUN_FINISHED = 7;
+        public const int MSG_BATCH = 8;
+        public const int MSG_HEARTBEAT = 9;
+
+        // Status codes (s field)
+        public const int STATUS_RUNNING = 1;
+        public const int STATUS_PASSED = 2;
+        public const int STATUS_FAILED = 3;
+        public const int STATUS_SKIPPED = 4;
+        public const int STATUS_ABORTED = 5;
+        public const int STATUS_FINISHED = 6;
+
+        // Direction codes (d field)
+        public const int DIR_TX = 1;
+        public const int DIR_RX = 2;
+
+        // Phase codes (p field)
+        public const int PHASE_TEARDOWN = 1;
+
+        // Field keys (short names for MessagePack maps)
+        public const string F_TYPE = "t";
+        public const string F_RUN_ID = "r";
+        public const string F_RUN_NAME = "n";
+        public const string F_STATUS = "s";
+        public const string F_TIMESTAMP = "ts";
+        public const string F_TC_FULL_NAME = "f";
+        public const string F_TC_ID = "i";
+        public const string F_MESSAGE = "m";
+        public const string F_COMPONENT = "c";
+        public const string F_CHANNEL = "ch";
+        public const string F_DIR = "d";
+        public const string F_PHASE = "p";
+        public const string F_ENTRIES = "e";
+        public const string F_EVENTS = "ev";
+        public const string F_EVENT_TYPE = "et";
+        public const string F_EXCEPTION_TYPE = "xt";
+        public const string F_STACK_TRACE = "st";
+        public const string F_IS_ERROR = "ie";
+        public const string F_USER_METADATA = "md";
+        public const string F_GROUP = "g";
+        public const string F_RETENTION_DAYS = "rd";
+        public const string F_LOCAL_RUN = "lr";
+        public const string F_ERROR = "err";
+        public const string F_RUN_URL = "ru";
+        public const string F_GROUP_URL = "gu";
+        public const string F_GROUP_HASH = "gh";
+
+        /// <summary>Unix epoch for timestamp calculations.</summary>
+        private static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        /// <summary>Convert DateTime to milliseconds since Unix epoch.</summary>
+        public static long ToMs(DateTime dt) => (long)(dt.ToUniversalTime() - UnixEpoch).TotalMilliseconds;
+
+        /// <summary>Get current timestamp in milliseconds since Unix epoch.</summary>
+        public static long NowMs() => ToMs(DateTime.UtcNow);
+
+        /// <summary>Convert status string to status code.</summary>
+        public static int StatusToCode(string status)
+        {
+            switch (status?.ToLower())
+            {
+                case "running": return STATUS_RUNNING;
+                case "passed": return STATUS_PASSED;
+                case "failed": return STATUS_FAILED;
+                case "skipped": return STATUS_SKIPPED;
+                case "aborted": return STATUS_ABORTED;
+                case "finished": return STATUS_FINISHED;
+                case "error": return STATUS_FAILED;  // Map error to failed
+                default: return STATUS_FAILED;
+            }
+        }
+
+        /// <summary>Convert direction string to direction code.</summary>
+        public static int? DirToCode(string dir)
+        {
+            switch (dir?.ToLower())
+            {
+                case "tx": return DIR_TX;
+                case "rx": return DIR_RX;
+                default: return null;
+            }
+        }
+
+        /// <summary>Convert phase string to phase code.</summary>
+        public static int? PhaseToCode(string phase)
+        {
+            switch (phase?.ToLower())
+            {
+                case "teardown": return PHASE_TEARDOWN;
+                default: return null;
+            }
+        }
+    }
+
     /// <summary>
     /// Helper class for managing WebSocket connections and high-performance event batching.
     /// Uses a unified event queue to batch test case starts, finishes, logs, and exceptions
@@ -28,8 +134,38 @@ namespace TestRift.NUnit
         private string _runId;  // Set by server response after run_started
         private ClientWebSocket _webSocket;
 
+        // String interning table for component/channel names
+        private readonly ConcurrentDictionary<string, int> _stringTable = new ConcurrentDictionary<string, int>();
+        private int _nextStringId = 1;
+
         // Unified event queue for all event types (TC start, TC finish, logs, exceptions)
         private readonly ConcurrentQueue<BatchEvent> _eventQueue = new ConcurrentQueue<BatchEvent>();
+
+        /// <summary>
+        /// Get or register an interned string. Returns [id, value] for first use, just id for subsequent.
+        /// </summary>
+        private object GetInternedString(string value)
+        {
+            if (string.IsNullOrEmpty(value)) return null;
+
+            if (_stringTable.TryGetValue(value, out var existingId))
+            {
+                return existingId;  // Already registered, return just the ID
+            }
+
+            // Register new string with next available ID
+            var newId = Interlocked.Increment(ref _nextStringId);
+            if (_stringTable.TryAdd(value, newId))
+            {
+                // First occurrence: return [id, value]
+                return new object[] { newId, value };
+            }
+            else
+            {
+                // Race condition: another thread registered it
+                return _stringTable[value];
+            }
+        }
         private readonly Timer _batchTimer;
         private readonly Timer _heartbeatTimer;
         private bool _disposed = false;
@@ -50,11 +186,9 @@ namespace TestRift.NUnit
         // Estimated current batch size for triggering early flush
         private long _estimatedBatchSize = 0;
 
-        // JSON serializer options
-        private static readonly JsonSerializerOptions _jsonOptions = new JsonSerializerOptions
-        {
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
-        };
+        // MessagePack serializer options - use ContractlessStandardResolver for dictionary serialization
+        private static readonly MessagePackSerializerOptions _msgpackOptions = MessagePackSerializerOptions.Standard
+            .WithResolver(MessagePack.Resolvers.ContractlessStandardResolver.Instance);
 
         public WebSocketHelper(string serverBaseUrl = null)
         {
@@ -108,21 +242,21 @@ namespace TestRift.NUnit
         {
             var runId = GetRunId();
             var runName = GetRunName();
-            var startTime = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+            var timestamp = Protocol.NowMs();
             var userMetadata = GetUserMetadata();
             var groupData = GetGroupData();
 
             var dataDict = new Dictionary<string, object>
             {
-                { "type", "run_started" },
-                { "run_name", runName },
-                { "start_time", startTime },
-                { "user_metadata", userMetadata },
-                { "group", groupData }
+                { Protocol.F_TYPE, Protocol.MSG_RUN_STARTED },
+                { Protocol.F_RUN_NAME, runName },
+                { Protocol.F_TIMESTAMP, timestamp },
+                { Protocol.F_USER_METADATA, userMetadata },
+                { Protocol.F_GROUP, groupData }
             };
             if (!string.IsNullOrEmpty(runId))
             {
-                dataDict["run_id"] = runId;
+                dataDict[Protocol.F_RUN_ID] = runId;
             }
 
             await SendWebSocketMessage(dataDict);
@@ -172,29 +306,33 @@ namespace TestRift.NUnit
 
                 var result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
 
-                if (result.MessageType == WebSocketMessageType.Text)
+                if (result.MessageType == WebSocketMessageType.Binary)
                 {
-                    var json = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                    using var doc = JsonDocument.Parse(json);
-                    var root = doc.RootElement;
+                    var data = new ReadOnlyMemory<byte>(buffer, 0, result.Count);
+                    var response = MessagePackSerializer.Deserialize<Dictionary<string, object>>(data, _msgpackOptions);
 
-                    if (root.TryGetProperty("type", out var typeProp) &&
-                        typeProp.GetString() == "run_started_response")
+                    // Check for message type (numeric code)
+                    // MessagePack deserializes small integers as byte, not int
+                    if (response.TryGetValue(Protocol.F_TYPE, out var typeObj) &&
+                        TryGetInt(typeObj, out var typeCode) &&
+                        typeCode == Protocol.MSG_RUN_STARTED_RESPONSE)
                     {
-                        if (root.TryGetProperty("error", out var errorProp))
+                        // Check for error
+                        if (response.TryGetValue(Protocol.F_ERROR, out var errorObj) && errorObj != null)
                         {
-                            var errorMessage = errorProp.GetString();
+                            var errorMessage = errorObj.ToString();
                             ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Run start failed: {errorMessage}");
                             throw new InvalidOperationException($"Run start failed: {errorMessage}");
                         }
 
-                        if (root.TryGetProperty("run_id", out var runIdProp))
+                        // Get run_id
+                        if (response.TryGetValue(Protocol.F_RUN_ID, out var runIdObj) && runIdObj != null)
                         {
-                            _runId = runIdProp.GetString();
+                            _runId = runIdObj.ToString();
                             ThreadSafeFileLogger.LogMessageSent($"Received run_id from server: {_runId}");
                         }
 
-                        WriteUrlFilesFromResponse(root);
+                        WriteUrlFilesFromResponse(response);
                     }
                 }
             }
@@ -220,7 +358,7 @@ namespace TestRift.NUnit
 
         private async Task PassiveReceiveLoopAsync(CancellationToken token)
         {
-            var buffer = new byte[1024];
+            var buffer = new byte[4096];
 
             while (!token.IsCancellationRequested)
             {
@@ -241,11 +379,9 @@ namespace TestRift.NUnit
                         break;
                     }
 
-                    if (result.MessageType == WebSocketMessageType.Text && result.Count > 0)
+                    if (result.MessageType == WebSocketMessageType.Binary && result.Count > 0)
                     {
-                        var message = Encoding.UTF8.GetString(buffer, 0, result.Count);
-                        var snippet = message.Length > 200 ? message.Substring(0, 200) + "..." : message;
-                        ThreadSafeFileLogger.Log($"Received server message ({result.Count} bytes): {snippet}");
+                        ThreadSafeFileLogger.Log($"Received server message ({result.Count} bytes)");
                     }
                 }
                 catch (OperationCanceledException)
@@ -287,7 +423,7 @@ namespace TestRift.NUnit
             }
         }
 
-        private void WriteUrlFilesFromResponse(JsonElement root)
+        private void WriteUrlFilesFromResponse(Dictionary<string, object> response)
         {
             try
             {
@@ -297,15 +433,19 @@ namespace TestRift.NUnit
                 var runUrlFile = config.UrlFiles.RunUrlFile;
                 var groupUrlFile = config.UrlFiles.GroupUrlFile;
 
-                if (!string.IsNullOrEmpty(runUrlFile) && root.TryGetProperty("run_url", out var runUrlProp))
+                if (!string.IsNullOrEmpty(runUrlFile) &&
+                    response.TryGetValue(Protocol.F_RUN_URL, out var runUrlObj) &&
+                    runUrlObj != null)
                 {
-                    var runUrl = _serverBaseUrl + runUrlProp.GetString();
+                    var runUrl = _serverBaseUrl + runUrlObj.ToString();
                     WriteUrlFile(runUrlFile, runUrl);
                 }
 
-                if (!string.IsNullOrEmpty(groupUrlFile) && root.TryGetProperty("group_url", out var groupUrlProp))
+                if (!string.IsNullOrEmpty(groupUrlFile) &&
+                    response.TryGetValue(Protocol.F_GROUP_URL, out var groupUrlObj) &&
+                    groupUrlObj != null)
                 {
-                    var groupUrl = _serverBaseUrl + groupUrlProp.GetString();
+                    var groupUrl = _serverBaseUrl + groupUrlObj.ToString();
                     WriteUrlFile(groupUrlFile, groupUrl);
                 }
             }
@@ -379,11 +519,12 @@ namespace TestRift.NUnit
             // Flush all pending events before finishing
             await FlushBatchAsync();
 
-            var data = new
+            var data = new Dictionary<string, object>
             {
-                type = "run_finished",
-                run_id = _runId,
-                status = "finished"
+                { Protocol.F_TYPE, Protocol.MSG_RUN_FINISHED },
+                { Protocol.F_RUN_ID, _runId },
+                { Protocol.F_STATUS, Protocol.STATUS_FINISHED },
+                { Protocol.F_TIMESTAMP, Protocol.NowMs() }
             };
 
             await SendWebSocketMessage(data);
@@ -405,20 +546,23 @@ namespace TestRift.NUnit
                 _testIdToTcId[nunitTestId] = tcId;
             }
 
+            // Parse timestamp if provided as ISO string, otherwise use current time
+            long timestamp;
+            if (!string.IsNullOrEmpty(startTime) && DateTime.TryParse(startTime, out var dt))
+                timestamp = Protocol.ToMs(dt);
+            else
+                timestamp = Protocol.NowMs();
+
             var eventData = new Dictionary<string, object>
             {
-                { "event_type", "test_case_started" },
-                { "tc_full_name", tcFullName },
-                { "tc_id", tcId },
-                { "tc_meta", new Dictionary<string, object>
-                    {
-                        { "status", "running" },
-                        { "start_time", startTime ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
-                    }
-                }
+                { Protocol.F_EVENT_TYPE, Protocol.MSG_TEST_CASE_STARTED },
+                { Protocol.F_TC_FULL_NAME, tcFullName },
+                { Protocol.F_TC_ID, tcId },
+                { Protocol.F_STATUS, Protocol.STATUS_RUNNING },
+                { Protocol.F_TIMESTAMP, timestamp }
             };
 
-            QueueEvent(new BatchEvent { EventType = "test_case_started", Data = eventData, TestCaseId = tcId });
+            QueueEvent(new BatchEvent { EventType = Protocol.MSG_TEST_CASE_STARTED, Data = eventData, TestCaseId = tcId });
         }
 
         /// <summary>
@@ -430,7 +574,7 @@ namespace TestRift.NUnit
             // Flush all pending events for this test case to ensure ordering
             await FlushEventsForTestCaseAsync(nunitTestId);
 
-            string standardizedStatus = ConvertNUnitResultAndErrorFlagToStatus(result, nunitTestId);
+            int statusCode = ConvertNUnitResultAndErrorFlagToStatusCode(result, nunitTestId);
             string tcId = nunitTestId;
 
             if (string.IsNullOrEmpty(tcId))
@@ -441,13 +585,14 @@ namespace TestRift.NUnit
 
             var eventData = new Dictionary<string, object>
             {
-                { "event_type", "test_case_finished" },
-                { "tc_id", tcId },
-                { "status", standardizedStatus }
+                { Protocol.F_EVENT_TYPE, Protocol.MSG_TEST_CASE_FINISHED },
+                { Protocol.F_TC_ID, tcId },
+                { Protocol.F_STATUS, statusCode },
+                { Protocol.F_TIMESTAMP, Protocol.NowMs() }
             };
 
             // For test case finished, send immediately (after flushing its pending events)
-            QueueEvent(new BatchEvent { EventType = "test_case_finished", Data = eventData, TestCaseId = tcId });
+            QueueEvent(new BatchEvent { EventType = Protocol.MSG_TEST_CASE_FINISHED, Data = eventData, TestCaseId = tcId });
             await FlushBatchAsync();
         }
 
@@ -479,25 +624,25 @@ namespace TestRift.NUnit
             return _testCaseIds.TryGetValue(tcFullName, out var tcId) ? tcId : null;
         }
 
-        private string ConvertNUnitResultAndErrorFlagToStatus(string nunitResult, string nunitTestId)
+        private int ConvertNUnitResultAndErrorFlagToStatusCode(string nunitResult, string nunitTestId)
         {
             if (!string.IsNullOrWhiteSpace(nunitTestId) &&
                 _testCasesWithErrors.TryGetValue(nunitTestId, out var hasError) && hasError)
             {
-                return "error";
+                return Protocol.STATUS_FAILED;  // Error maps to failed
             }
 
-            if (string.IsNullOrEmpty(nunitResult)) return "failed";
+            if (string.IsNullOrEmpty(nunitResult)) return Protocol.STATUS_FAILED;
 
             switch (nunitResult.ToLower())
             {
-                case "passed": return "passed";
-                case "failed": return "failed";
-                case "skipped": return "skipped";
-                case "inconclusive": return "failed";
+                case "passed": return Protocol.STATUS_PASSED;
+                case "failed": return Protocol.STATUS_FAILED;
+                case "skipped": return Protocol.STATUS_SKIPPED;
+                case "inconclusive": return Protocol.STATUS_FAILED;
                 default:
                     ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Unexpected NUnit result: {nunitResult}, defaulting to failed");
-                    return "failed";
+                    return Protocol.STATUS_FAILED;
             }
         }
 
@@ -528,18 +673,25 @@ namespace TestRift.NUnit
                 ? new List<string>(lines)
                 : new List<string>(stackTrace.Replace("\r\n", "\n").Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries));
 
+            // Parse timestamp if provided as ISO string, otherwise use current time
+            long tsMs;
+            if (!string.IsNullOrEmpty(timestamp) && DateTime.TryParse(timestamp, out var dt))
+                tsMs = Protocol.ToMs(dt);
+            else
+                tsMs = Protocol.NowMs();
+
             var eventData = new Dictionary<string, object>
             {
-                { "event_type", "exception" },
-                { "tc_id", tcId },
-                { "timestamp", timestamp ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ") },
-                { "message", message },
-                { "exception_type", exceptionType },
-                { "is_error", isError },
-                { "stack_trace", normalizedLines }
+                { Protocol.F_EVENT_TYPE, Protocol.MSG_EXCEPTION },
+                { Protocol.F_TC_ID, tcId },
+                { Protocol.F_TIMESTAMP, tsMs },
+                { Protocol.F_MESSAGE, message },
+                { Protocol.F_EXCEPTION_TYPE, exceptionType },
+                { Protocol.F_IS_ERROR, isError },
+                { Protocol.F_STACK_TRACE, normalizedLines }
             };
 
-            QueueEvent(new BatchEvent { EventType = "exception", Data = eventData, TestCaseId = tcId });
+            QueueEvent(new BatchEvent { EventType = Protocol.MSG_EXCEPTION, Data = eventData, TestCaseId = tcId });
         }
 
         /// <summary>
@@ -582,14 +734,21 @@ namespace TestRift.NUnit
                 throw new ArgumentException("dir must be 'tx' or 'rx' if provided", nameof(dir));
             }
 
+            // Parse timestamp if provided as ISO string, otherwise use current time
+            long tsMs;
+            if (!string.IsNullOrEmpty(timestamp) && DateTime.TryParse(timestamp, out var dt))
+                tsMs = Protocol.ToMs(dt);
+            else
+                tsMs = Protocol.NowMs();
+
             var logEntry = new LogEntry
             {
-                timestamp = timestamp ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
-                message = message,
-                component = component ?? Environment.MachineName,
-                channel = channel,
-                dir = dir,
-                phase = phase
+                TimestampMs = tsMs,
+                Message = message,
+                ComponentRaw = component ?? Environment.MachineName,
+                ChannelRaw = channel,
+                DirCode = Protocol.DirToCode(dir),
+                PhaseCode = Protocol.PhaseToCode(phase)
             };
 
             // Create or add to existing log batch event for this test case
@@ -613,17 +772,9 @@ namespace TestRift.NUnit
         {
             string tcId = nunitTestId ?? "global";
 
-            var eventData = new Dictionary<string, object>
-            {
-                { "event_type", "log_batch" },
-                { "tc_id", tcId },
-                { "entries", new List<LogEntry> { entry } }
-            };
-
             var batchEvent = new BatchEvent
             {
-                EventType = "log_batch",
-                Data = eventData,
+                EventType = Protocol.MSG_LOG_BATCH,
                 TestCaseId = tcId,
                 LogEntry = entry
             };
@@ -647,14 +798,14 @@ namespace TestRift.NUnit
         private static int EstimateEventSize(BatchEvent evt)
         {
             // Rough estimate: base overhead + message content
-            int size = 100; // Base JSON overhead
+            int size = 50; // Base MessagePack overhead (smaller than JSON)
             if (evt.LogEntry != null)
             {
-                size += (evt.LogEntry.message?.Length ?? 0) + (evt.LogEntry.component?.Length ?? 0) + 50;
+                size += (evt.LogEntry.Message?.Length ?? 0) + 30;
             }
             else if (evt.Data != null)
             {
-                size += 200; // Estimated size for other event types
+                size += 150; // Estimated size for other event types
             }
             return size;
         }
@@ -688,7 +839,11 @@ namespace TestRift.NUnit
 
             try
             {
-                var heartbeat = new { type = "heartbeat", run_id = _runId };
+                var heartbeat = new Dictionary<string, object>
+                {
+                    { Protocol.F_TYPE, Protocol.MSG_HEARTBEAT },
+                    { Protocol.F_RUN_ID, _runId }
+                };
                 await SendWebSocketMessage(heartbeat);
                 ThreadSafeFileLogger.Log($"Heartbeat sent (last activity {timeSinceLastSend.TotalSeconds:F1}s ago)");
             }
@@ -718,7 +873,7 @@ namespace TestRift.NUnit
                     count++;
 
                     // Consolidate log entries for the same test case
-                    if (evt.EventType == "log_batch" && evt.LogEntry != null)
+                    if (evt.EventType == Protocol.MSG_LOG_BATCH && evt.LogEntry != null)
                     {
                         var tcId = evt.TestCaseId ?? "global";
                         if (!logBatches.TryGetValue(tcId, out var entries))
@@ -734,14 +889,41 @@ namespace TestRift.NUnit
                     }
                 }
 
-                // Add consolidated log batches
+                // Add consolidated log batches with string interning
                 foreach (var kvp in logBatches)
                 {
+                    var entriesList = new List<Dictionary<string, object>>();
+                    foreach (var entry in kvp.Value)
+                    {
+                        var entryDict = new Dictionary<string, object>
+                        {
+                            { Protocol.F_TIMESTAMP, entry.TimestampMs },
+                            { Protocol.F_MESSAGE, entry.Message }
+                        };
+
+                        // Use interned strings for component/channel
+                        var componentInterned = GetInternedString(entry.ComponentRaw);
+                        if (componentInterned != null)
+                            entryDict[Protocol.F_COMPONENT] = componentInterned;
+
+                        var channelInterned = GetInternedString(entry.ChannelRaw);
+                        if (channelInterned != null)
+                            entryDict[Protocol.F_CHANNEL] = channelInterned;
+
+                        if (entry.DirCode.HasValue)
+                            entryDict[Protocol.F_DIR] = entry.DirCode.Value;
+
+                        if (entry.PhaseCode.HasValue)
+                            entryDict[Protocol.F_PHASE] = entry.PhaseCode.Value;
+
+                        entriesList.Add(entryDict);
+                    }
+
                     events.Add(new Dictionary<string, object>
                     {
-                        { "event_type", "log_batch" },
-                        { "tc_id", kvp.Key },
-                        { "entries", kvp.Value }
+                        { Protocol.F_EVENT_TYPE, Protocol.MSG_LOG_BATCH },
+                        { Protocol.F_TC_ID, kvp.Key },
+                        { Protocol.F_ENTRIES, entriesList }
                     });
                 }
 
@@ -749,11 +931,11 @@ namespace TestRift.NUnit
 
                 if (events.Count == 0) return;
 
-                var batchMessage = new
+                var batchMessage = new Dictionary<string, object>
                 {
-                    type = "batch",
-                    run_id = _runId,
-                    events = events
+                    { Protocol.F_TYPE, Protocol.MSG_BATCH },
+                    { Protocol.F_RUN_ID, _runId },
+                    { Protocol.F_EVENTS, events }
                 };
 
                 await SendWebSocketMessageDirect(batchMessage);
@@ -806,12 +988,10 @@ namespace TestRift.NUnit
                 return;
             }
 
-            string json;
             byte[] bytes;
             try
             {
-                json = JsonSerializer.Serialize(data, _jsonOptions);
-                bytes = Encoding.UTF8.GetBytes(json);
+                bytes = MessagePackSerializer.Serialize(data, _msgpackOptions);
             }
             catch (Exception ex)
             {
@@ -829,7 +1009,7 @@ namespace TestRift.NUnit
                     return;
                 }
 
-                await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
+                await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Binary, true, CancellationToken.None);
                 ThreadSafeFileLogger.LogSendCompleted(messageId, messageType, bytes.Length);
             }
             catch (Exception ex)
@@ -1012,19 +1192,35 @@ namespace TestRift.NUnit
             }
         }
 
+        /// <summary>
+        /// Safely converts a MessagePack-deserialized value to int.
+        /// MessagePack uses minimal encoding, so small integers may be byte, sbyte, short, etc.
+        /// </summary>
+        private static bool TryGetInt(object value, out int result)
+        {
+            result = 0;
+            if (value == null) return false;
+
+            try
+            {
+                result = Convert.ToInt32(value);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private static string GetMessageType(object data)
         {
             if (data == null) return "null";
 
-            if (data is IDictionary<string, object> dict && dict.TryGetValue("type", out var value) && value != null)
-                return value.ToString();
-
-            var typeProperty = data.GetType().GetProperty("type");
-            if (typeProperty != null)
+            if (data is IDictionary<string, object> dict &&
+                dict.TryGetValue(Protocol.F_TYPE, out var typeValue) &&
+                typeValue != null)
             {
-                var propertyValue = typeProperty.GetValue(data);
-                if (propertyValue != null)
-                    return propertyValue.ToString();
+                return typeValue.ToString();
             }
 
             return "unknown";
@@ -1045,22 +1241,34 @@ namespace TestRift.NUnit
     /// </summary>
     internal class BatchEvent
     {
-        public string EventType { get; set; }
+        public int EventType { get; set; }
         public Dictionary<string, object> Data { get; set; }
         public string TestCaseId { get; set; }
         public LogEntry LogEntry { get; set; }  // For log_batch events, store the entry directly
     }
 
     /// <summary>
-    /// Log entry for WebSocket messages. Only includes non-null fields when serialized.
+    /// Log entry for WebSocket messages using optimized binary format.
+    /// Stores raw values; string interning is applied during batch serialization.
     /// </summary>
-    public class LogEntry
+    internal class LogEntry
     {
-        public string timestamp { get; set; }
-        public string message { get; set; }
-        public string component { get; set; }
-        public string channel { get; set; }
-        public string dir { get; set; }
-        public string phase { get; set; }
+        /// <summary>Timestamp in milliseconds since Unix epoch.</summary>
+        public long TimestampMs { get; set; }
+
+        /// <summary>Log message text.</summary>
+        public string Message { get; set; }
+
+        /// <summary>Raw component name (will be interned during serialization).</summary>
+        public string ComponentRaw { get; set; }
+
+        /// <summary>Raw channel name (will be interned during serialization).</summary>
+        public string ChannelRaw { get; set; }
+
+        /// <summary>Direction code (1=tx, 2=rx) or null if not specified.</summary>
+        public int? DirCode { get; set; }
+
+        /// <summary>Phase code (1=teardown) or null if not specified.</summary>
+        public int? PhaseCode { get; set; }
     }
 }

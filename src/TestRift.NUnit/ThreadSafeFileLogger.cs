@@ -51,9 +51,9 @@ namespace TestRift.NUnit
             Log($"WebSocket not open, state: {state}");
         }
 
-        public static void LogMessageSent(string json)
+        public static void LogMessageSent(string message)
         {
-            Log($"Sent message: {json}");
+            Log($"Sent message: {message}");
         }
 
         public static void LogSendFailed(string error)

@@ -115,12 +115,9 @@ namespace TestRift.NUnit
                 // SendTestCaseFinished will flush any remaining queued messages before sending the finished message
                 if (_webSocketHelper != null)
                 {
-                    _ = Task.Run(async () =>
-                    {
-                        await _webSocketHelper.SendTestCaseFinished(
-                            test.Id,
-                            TestContext.CurrentContext.Result.Outcome.ToString());
-                    });
+                    _webSocketHelper.SendTestCaseFinished(
+                        test.Id,
+                        TestContext.CurrentContext.Result.Outcome.ToString()).GetAwaiter().GetResult();
                 }
 
             }
