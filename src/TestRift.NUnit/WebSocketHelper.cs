@@ -13,33 +13,48 @@ using System.Threading.Tasks;
 namespace TestRift.NUnit
 {
     /// <summary>
-    /// Helper class for managing WebSocket connections and message pooling
+    /// Helper class for managing WebSocket connections and high-performance event batching.
+    /// Uses a unified event queue to batch test case starts, finishes, logs, and exceptions
+    /// into single WebSocket frames for optimal throughput.
     /// </summary>
     public class WebSocketHelper : IDisposable
     {
+        private const int BatchIntervalMs = 250;        // Send batches every 250ms
+        private const int MaxBatchSizeBytes = 131072;   // Flush when buffered data exceeds 128KB
+        private const int MaxEventsPerBatch = 500;      // Maximum events per batch message
+        private const int HeartbeatIntervalMs = 10000;  // Send heartbeat every 10 seconds if no activity
+
         private readonly string _serverBaseUrl;
         private string _runId;  // Set by server response after run_started
         private ClientWebSocket _webSocket;
-        private readonly ConcurrentQueue<LogEntry> _messageQueue = new ConcurrentQueue<LogEntry>();
+
+        // Unified event queue for all event types (TC start, TC finish, logs, exceptions)
+        private readonly ConcurrentQueue<BatchEvent> _eventQueue = new ConcurrentQueue<BatchEvent>();
         private readonly Timer _batchTimer;
+        private readonly Timer _heartbeatTimer;
         private bool _disposed = false;
-        private readonly SemaphoreSlim _flushSemaphore = new SemaphoreSlim(1, 1);
-        private volatile bool _isFlushing = false;
         private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1, 1);
-        private readonly ConcurrentDictionary<string, SemaphoreSlim> _testCaseSendLocks = new ConcurrentDictionary<string, SemaphoreSlim>();
         private readonly HttpClient _httpClient;
         private CancellationTokenSource _receiveLoopCts;
         private Task _receiveLoopTask;
         private long _messageSequence;
+        private DateTime _lastSendTime = DateTime.UtcNow;
+
         // Tracks test cases that have reported unexpected/unhandled errors (is_error = true)
-        // so we can map their final status to "error" instead of "failed".
         private readonly ConcurrentDictionary<string, bool> _testCasesWithErrors = new ConcurrentDictionary<string, bool>();
-        // Counter for generating tc_id (8-char hex)
-        private int _testCaseCounter = 0;
         // Maps tc_full_name to tc_id
         private readonly ConcurrentDictionary<string, string> _testCaseIds = new ConcurrentDictionary<string, string>();
         // Maps NUnit test.Id to tc_id (for concurrent test execution)
         private readonly ConcurrentDictionary<string, string> _testIdToTcId = new ConcurrentDictionary<string, string>();
+
+        // Estimated current batch size for triggering early flush
+        private long _estimatedBatchSize = 0;
+
+        // JSON serializer options
+        private static readonly JsonSerializerOptions _jsonOptions = new JsonSerializerOptions
+        {
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+        };
 
         public WebSocketHelper(string serverBaseUrl = null)
         {
@@ -49,7 +64,6 @@ namespace TestRift.NUnit
             }
             else
             {
-                // Prefer YAML config if available; otherwise fall back to localhost.
                 try
                 {
                     var cfg = ConfigManager.Get();
@@ -60,12 +74,14 @@ namespace TestRift.NUnit
                     _serverBaseUrl = "http://localhost:8080";
                 }
             }
-            _runId = null;  // Will be set by server response
+            _runId = null;
 
-            // Initialize batch timer to send messages every 1 second
-            _batchTimer = new Timer(SendBatchedMessages, null, TimeSpan.FromSeconds(1), TimeSpan.FromSeconds(1));
+            // Initialize batch timer for regular flushing
+            _batchTimer = new Timer(OnBatchTimerTick, null, BatchIntervalMs, BatchIntervalMs);
 
-            // Initialize HTTP client for attachment uploads
+            // Initialize heartbeat timer to keep connection alive during idle periods
+            _heartbeatTimer = new Timer(OnHeartbeatTimerTick, null, HeartbeatIntervalMs, HeartbeatIntervalMs);
+
             _httpClient = new HttpClient();
         }
 
@@ -78,7 +94,6 @@ namespace TestRift.NUnit
                 var uri = new Uri(_serverBaseUrl.Replace("http://", "ws://").Replace("https://", "wss://") + "/ws/nunit");
                 await _webSocket.ConnectAsync(uri, CancellationToken.None);
 
-                // Debug: Write to file instead of console
                 ThreadSafeFileLogger.LogWebSocketConnected(uri.ToString());
                 ThreadSafeFileLogger.LogWebSocketStateDetails("Post-connect", _webSocket.State, _webSocket.CloseStatus, _webSocket.CloseStatusDescription);
             }
@@ -97,7 +112,6 @@ namespace TestRift.NUnit
             var userMetadata = GetUserMetadata();
             var groupData = GetGroupData();
 
-            // Build message dictionary, only including run_id if it's set
             var dataDict = new Dictionary<string, object>
             {
                 { "type", "run_started" },
@@ -112,10 +126,7 @@ namespace TestRift.NUnit
             }
 
             await SendWebSocketMessage(dataDict);
-
-            // Wait for server response with run_id and URLs
             await WaitForRunStartedResponse();
-
             StartPassiveReceiveLoop();
         }
 
@@ -153,12 +164,11 @@ namespace TestRift.NUnit
                 {
                     var stateSnapshot = DescribeSocketState();
                     ThreadSafeFileLogger.LogWebSocketNotOpen(stateSnapshot);
-                    ThreadSafeFileLogger.LogWebSocketStateDetails("wait_run_started", _webSocket?.State, _webSocket?.CloseStatus, _webSocket?.CloseStatusDescription);
                     throw new InvalidOperationException($"WebSocket connection is not open (state: {stateSnapshot})");
                 }
 
                 var buffer = new byte[4096];
-                var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10)); // 10 second timeout
+                var cts = new CancellationTokenSource(TimeSpan.FromSeconds(10));
 
                 var result = await _webSocket.ReceiveAsync(new ArraySegment<byte>(buffer), cts.Token);
 
@@ -171,7 +181,6 @@ namespace TestRift.NUnit
                     if (root.TryGetProperty("type", out var typeProp) &&
                         typeProp.GetString() == "run_started_response")
                     {
-                        // Check for error response
                         if (root.TryGetProperty("error", out var errorProp))
                         {
                             var errorMessage = errorProp.GetString();
@@ -179,14 +188,12 @@ namespace TestRift.NUnit
                             throw new InvalidOperationException($"Run start failed: {errorMessage}");
                         }
 
-                        // Get run_id from server
                         if (root.TryGetProperty("run_id", out var runIdProp))
                         {
                             _runId = runIdProp.GetString();
                             ThreadSafeFileLogger.LogMessageSent($"Received run_id from server: {_runId}");
                         }
 
-                        // Write URL files
                         WriteUrlFilesFromResponse(root);
                     }
                 }
@@ -196,20 +203,17 @@ namespace TestRift.NUnit
                 ThreadSafeFileLogger.LogWebSocketConnectionFailed("Timeout waiting for run_started_response");
                 throw new InvalidOperationException("Timeout waiting for run_started_response from server");
             }
-            // Don't catch other exceptions - let them propagate to abort the test run
         }
 
         private void StartPassiveReceiveLoop()
         {
             if (_receiveLoopTask != null && !_receiveLoopTask.IsCompleted)
-            {
                 return;
-            }
 
             _receiveLoopCts?.Cancel();
             _receiveLoopCts?.Dispose();
-
             _receiveLoopCts = new CancellationTokenSource();
+
             ThreadSafeFileLogger.Log("Passive receive loop starting");
             _receiveLoopTask = Task.Run(() => PassiveReceiveLoopAsync(_receiveLoopCts.Token));
         }
@@ -232,7 +236,6 @@ namespace TestRift.NUnit
 
                     if (result.MessageType == WebSocketMessageType.Close)
                     {
-                        ThreadSafeFileLogger.LogWebSocketStateDetails("Server close frame", result.CloseStatus.HasValue ? WebSocketState.CloseSent : _webSocket?.State, result.CloseStatus, result.CloseStatusDescription);
                         ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Server closed WebSocket: {result.CloseStatus} {result.CloseStatusDescription}");
                         await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Closing", CancellationToken.None);
                         break;
@@ -247,21 +250,15 @@ namespace TestRift.NUnit
                 }
                 catch (OperationCanceledException)
                 {
-                    ThreadSafeFileLogger.Log("Passive receive loop canceled");
                     break;
                 }
                 catch (ObjectDisposedException)
                 {
-                    ThreadSafeFileLogger.Log("Passive receive loop disposed socket");
                     break;
                 }
                 catch (Exception ex)
                 {
                     ThreadSafeFileLogger.LogWebSocketException("Passive receive loop", ex);
-                    if (ex is WebSocketException wsEx)
-                    {
-                        ThreadSafeFileLogger.LogWebSocketStateDetails($"Passive receive loop fault (code={wsEx.WebSocketErrorCode})", _webSocket?.State, _webSocket?.CloseStatus, _webSocket?.CloseStatusDescription);
-                    }
                     await Task.Delay(1000, token);
                 }
             }
@@ -269,10 +266,7 @@ namespace TestRift.NUnit
 
         private void StopPassiveReceiveLoop()
         {
-            if (_receiveLoopCts == null)
-            {
-                return;
-            }
+            if (_receiveLoopCts == null) return;
 
             try
             {
@@ -298,20 +292,17 @@ namespace TestRift.NUnit
             try
             {
                 var config = ConfigManager.Get();
-                if (config.UrlFiles == null)
-                    return;
+                if (config.UrlFiles == null) return;
 
                 var runUrlFile = config.UrlFiles.RunUrlFile;
                 var groupUrlFile = config.UrlFiles.GroupUrlFile;
 
-                // Write run URL file if configured
                 if (!string.IsNullOrEmpty(runUrlFile) && root.TryGetProperty("run_url", out var runUrlProp))
                 {
                     var runUrl = _serverBaseUrl + runUrlProp.GetString();
                     WriteUrlFile(runUrlFile, runUrl);
                 }
 
-                // Write group URL file if configured and group exists
                 if (!string.IsNullOrEmpty(groupUrlFile) && root.TryGetProperty("group_url", out var groupUrlProp))
                 {
                     var groupUrl = _serverBaseUrl + groupUrlProp.GetString();
@@ -333,10 +324,8 @@ namespace TestRift.NUnit
             }
             catch (Exception ex)
             {
-                // If config is not loaded, use empty metadata
                 ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Failed to get user metadata: {ex.Message}");
             }
-
             return new Dictionary<string, object>();
         }
 
@@ -346,9 +335,7 @@ namespace TestRift.NUnit
             {
                 var config = ConfigManager.Get();
                 if (config.Group == null || string.IsNullOrWhiteSpace(config.Group.Name))
-                {
                     return null;
-                }
 
                 return new
                 {
@@ -366,23 +353,14 @@ namespace TestRift.NUnit
         private static Dictionary<string, object> BuildMetadataDictionary(IEnumerable<MetadataEntry> entries)
         {
             var metadata = new Dictionary<string, object>();
-            if (entries == null)
-            {
-                return metadata;
-            }
+            if (entries == null) return metadata;
 
             foreach (var entry in entries)
             {
-                if (entry == null)
-                {
-                    continue;
-                }
+                if (entry == null) continue;
 
                 var expandedName = VarExpander.Expand(entry.Name ?? string.Empty).Trim();
-                if (string.IsNullOrWhiteSpace(expandedName))
-                {
-                    continue;
-                }
+                if (string.IsNullOrWhiteSpace(expandedName)) continue;
 
                 var expandedValue = VarExpander.Expand(entry.Value ?? string.Empty);
                 var expandedUrl = entry.Url != null ? VarExpander.Expand(entry.Url) : null;
@@ -393,12 +371,14 @@ namespace TestRift.NUnit
                     url = expandedUrl
                 };
             }
-
             return metadata;
         }
 
         public async Task SendRunFinished()
         {
+            // Flush all pending events before finishing
+            await FlushBatchAsync();
+
             var data = new
             {
                 type = "run_finished",
@@ -407,120 +387,124 @@ namespace TestRift.NUnit
             };
 
             await SendWebSocketMessage(data);
+
+            // Gracefully close the WebSocket after run_finished to ensure server receives the message
+            await CloseAsync();
         }
 
-        public async Task SendTestCaseStarted(string tcFullName, string nunitTestId, string startTime = null)
+        /// <summary>
+        /// Queue a test case started event for batched sending.
+        /// </summary>
+        public void QueueTestCaseStarted(string tcFullName, string nunitTestId, string startTime = null)
         {
-            // Use NUnit test ID as tc_id directly (no need to generate a separate ID)
-            // This simplifies the code and makes it more reliable for concurrent tests
             var tcId = nunitTestId;
 
-            // Register mapping for lookup (keep for backward compatibility if needed)
             _testCaseIds[tcFullName] = tcId;
             if (!string.IsNullOrEmpty(nunitTestId))
             {
                 _testIdToTcId[nunitTestId] = tcId;
             }
 
-            var data = new
+            var eventData = new Dictionary<string, object>
             {
-                type = "test_case_started",
-                run_id = _runId,
-                tc_full_name = tcFullName,
-                tc_id = tcId,
-                tc_meta = new
-                {
-                    status = "running",
-                    start_time = startTime ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ")
+                { "event_type", "test_case_started" },
+                { "tc_full_name", tcFullName },
+                { "tc_id", tcId },
+                { "tc_meta", new Dictionary<string, object>
+                    {
+                        { "status", "running" },
+                        { "start_time", startTime ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ") }
+                    }
                 }
             };
 
-            // Send the message and wait for it to complete
-            await SendWebSocketMessage(data);
+            QueueEvent(new BatchEvent { EventType = "test_case_started", Data = eventData, TestCaseId = tcId });
         }
 
         /// <summary>
-        /// Get tc_id from NUnit test.Id (for concurrent test execution)
+        /// Queue a test case finished event for batched sending.
+        /// Automatically flushes pending events for this test case first.
         /// </summary>
-        public string GetTcIdFromTestId(string nunitTestId)
+        public async Task QueueTestCaseFinishedAsync(string nunitTestId, string result)
         {
-            return _testIdToTcId.TryGetValue(nunitTestId, out var tcId) ? tcId : null;
-        }
+            // Flush all pending events for this test case to ensure ordering
+            await FlushEventsForTestCaseAsync(nunitTestId);
 
-        /// <summary>
-        /// Get tc_id from test case full name
-        /// </summary>
-        public string GetTcIdFromFullName(string tcFullName)
-        {
-            return _testCaseIds.TryGetValue(tcFullName, out var tcId) ? tcId : null;
-        }
-
-        public async Task SendTestCaseFinished(string nunitTestId, string result)
-        {
-            // First, flush all queued messages for this test case to ensure proper ordering
-            await FlushMessagesForTestCase(nunitTestId);
-
-            // Convert NUnit result + any recorded error flag to standardized status format
             string standardizedStatus = ConvertNUnitResultAndErrorFlagToStatus(result, nunitTestId);
-
-            // Use NUnit test ID directly as tc_id
             string tcId = nunitTestId;
+
             if (string.IsNullOrEmpty(tcId))
             {
                 ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty for test case");
                 return;
             }
 
-            // Then send the test case finished message
-            var data = new
+            var eventData = new Dictionary<string, object>
             {
-                type = "test_case_finished",
-                run_id = _runId,
-                tc_id = tcId,
-                status = standardizedStatus
+                { "event_type", "test_case_finished" },
+                { "tc_id", tcId },
+                { "status", standardizedStatus }
             };
 
-            await SendWebSocketMessage(data);
+            // For test case finished, send immediately (after flushing its pending events)
+            QueueEvent(new BatchEvent { EventType = "test_case_finished", Data = eventData, TestCaseId = tcId });
+            await FlushBatchAsync();
         }
 
         /// <summary>
-        /// Convert NUnit result + any recorded error flag into the wire status.
-        /// - If the test case has reported an unexpected/unhandled error (is_error = true), return "error".
-        /// - Otherwise, map NUnit result to "passed" / "failed" / "skipped".
+        /// Async method for test case started - queues and flushes for immediate sending.
         /// </summary>
+        public async Task SendTestCaseStarted(string tcFullName, string nunitTestId, string startTime = null)
+        {
+            QueueTestCaseStarted(tcFullName, nunitTestId, startTime);
+            // For TC start, we want it sent quickly so trigger a flush
+            await FlushBatchAsync();
+        }
+
+        /// <summary>
+        /// Async method for test case finished.
+        /// </summary>
+        public async Task SendTestCaseFinished(string nunitTestId, string result)
+        {
+            await QueueTestCaseFinishedAsync(nunitTestId, result);
+        }
+
+        public string GetTcIdFromTestId(string nunitTestId)
+        {
+            return _testIdToTcId.TryGetValue(nunitTestId, out var tcId) ? tcId : null;
+        }
+
+        public string GetTcIdFromFullName(string tcFullName)
+        {
+            return _testCaseIds.TryGetValue(tcFullName, out var tcId) ? tcId : null;
+        }
+
         private string ConvertNUnitResultAndErrorFlagToStatus(string nunitResult, string nunitTestId)
         {
-            // If we saw an is_error=true exception for this test case, treat it as "error"
             if (!string.IsNullOrWhiteSpace(nunitTestId) &&
-                _testCasesWithErrors.TryGetValue(nunitTestId, out var hasError) &&
-                hasError)
+                _testCasesWithErrors.TryGetValue(nunitTestId, out var hasError) && hasError)
             {
                 return "error";
             }
 
-            if (string.IsNullOrEmpty(nunitResult))
-                return "failed";
+            if (string.IsNullOrEmpty(nunitResult)) return "failed";
 
-            // NUnit returns: "Passed", "Failed", "Skipped", "Inconclusive"
-            // Convert to standardized status: "passed", "failed", "skipped", "failed"
             switch (nunitResult.ToLower())
             {
-                case "passed":
-                    return "passed";
-                case "failed":
-                    return "failed";
-                case "skipped":
-                    return "skipped";
-                case "inconclusive":
-                    return "failed"; // Inconclusive tests are treated as failed
+                case "passed": return "passed";
+                case "failed": return "failed";
+                case "skipped": return "skipped";
+                case "inconclusive": return "failed";
                 default:
-                    // For any unexpected values, default to failed
                     ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Unexpected NUnit result: {nunitResult}, defaulting to failed");
                     return "failed";
             }
         }
 
-        public Task SendExceptionAsync(
+        /// <summary>
+        /// Queue an exception event for batched sending.
+        /// </summary>
+        public void QueueException(
             string nunitTestId,
             string message,
             string stackTrace,
@@ -530,44 +514,48 @@ namespace TestRift.NUnit
             string timestamp = null)
         {
             if (string.IsNullOrEmpty(_runId) || string.IsNullOrWhiteSpace(nunitTestId) || string.IsNullOrWhiteSpace(stackTrace))
-            {
-                return Task.CompletedTask;
-            }
+                return;
 
-            // Remember that this test case had an unexpected/unhandled error so its final
-            // status can be reported as "error" instead of "failed".
             if (isError)
             {
                 _testCasesWithErrors[nunitTestId] = true;
             }
 
-            // Use NUnit test ID directly as tc_id
             string tcId = nunitTestId;
-            if (string.IsNullOrEmpty(tcId))
-            {
-                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty for test case");
-                return Task.CompletedTask;
-            }
+            if (string.IsNullOrEmpty(tcId)) return;
 
-            // Normalize the stack trace into a list of lines. This becomes the canonical representation.
             var normalizedLines = lines != null
                 ? new List<string>(lines)
                 : new List<string>(stackTrace.Replace("\r\n", "\n").Split(new[] { '\n' }, StringSplitOptions.RemoveEmptyEntries));
 
-            var data = new
+            var eventData = new Dictionary<string, object>
             {
-                type = "exception",
-                run_id = _runId,
-                tc_id = tcId,
-                timestamp = timestamp ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"),
-                message,
-                exception_type = exceptionType,
-                is_error = isError,
-                // stack_trace is a list of strings representing the full multiline stack trace
-                stack_trace = normalizedLines
+                { "event_type", "exception" },
+                { "tc_id", tcId },
+                { "timestamp", timestamp ?? DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ") },
+                { "message", message },
+                { "exception_type", exceptionType },
+                { "is_error", isError },
+                { "stack_trace", normalizedLines }
             };
 
-            return SendWebSocketMessage(data);
+            QueueEvent(new BatchEvent { EventType = "exception", Data = eventData, TestCaseId = tcId });
+        }
+
+        /// <summary>
+        /// Async method for sending exception (queues for batching).
+        /// </summary>
+        public Task SendExceptionAsync(
+            string nunitTestId,
+            string message,
+            string stackTrace,
+            string exceptionType = null,
+            IEnumerable<string> lines = null,
+            bool isError = false,
+            string timestamp = null)
+        {
+            QueueException(nunitTestId, message, stackTrace, exceptionType, lines, isError, timestamp);
+            return Task.CompletedTask;
         }
 
         public void SendException(
@@ -579,28 +567,16 @@ namespace TestRift.NUnit
             bool isError = false,
             string timestamp = null)
         {
-            _ = SendExceptionAsync(nunitTestId, message, stackTrace, exceptionType, lines, isError, timestamp);
-        }
-
-        public void QueueMessage(string message, string source = "console", string testCaseId = null)
-        {
-            QueueMessage(message, source, testCaseId, DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"));
+            QueueException(nunitTestId, message, stackTrace, exceptionType, lines, isError, timestamp);
         }
 
         /// <summary>
-        /// Queues a log message with full control over component, channel, and direction.
+        /// Queue a log message for batched sending.
         /// </summary>
-        /// <param name="message">The log message text</param>
-        /// <param name="component">The component name</param>
-        /// <param name="channel">Optional channel name</param>
-        /// <param name="dir">Optional direction: "tx" or "rx"</param>
-        /// <param name="nunitTestId">Optional NUnit test ID (for concurrent test execution)</param>
-        /// <param name="timestamp">Optional timestamp (uses current time if not provided)</param>
         public void QueueLogMessage(string message, string component, string channel = null, string dir = null, string nunitTestId = null, string timestamp = null, string phase = null)
         {
             if (string.IsNullOrEmpty(_runId) || string.IsNullOrEmpty(message)) return;
 
-            // Validate dir if provided
             if (!string.IsNullOrEmpty(dir) && dir != "tx" && dir != "rx")
             {
                 throw new ArgumentException("dir must be 'tx' or 'rx' if provided", nameof(dir));
@@ -613,110 +589,211 @@ namespace TestRift.NUnit
                 component = component ?? Environment.MachineName,
                 channel = channel,
                 dir = dir,
-                testCaseId = nunitTestId,  // Stores NUnit test ID for lookup
                 phase = phase
             };
 
-            _messageQueue.Enqueue(logEntry);
-
-            // Send immediately if we have a specific test case ID
-            if (!string.IsNullOrEmpty(nunitTestId))
-            {
-                // Use a per-test-case lock to ensure messages are sent in order
-                var sendLock = _testCaseSendLocks.GetOrAdd(nunitTestId, _ => new SemaphoreSlim(1, 1));
-                _ = Task.Run(async () =>
-                {
-                    await sendLock.WaitAsync();
-                    try
-                    {
-                        await SendLogBatch(nunitTestId);
-                    }
-                    finally
-                    {
-                        sendLock.Release();
-                    }
-                });
-            }
+            // Create or add to existing log batch event for this test case
+            QueueLogEntry(nunitTestId, logEntry);
         }
 
         /// <summary>
-        /// Legacy method: Queues a log message using source as channel.
-        /// Kept for backward compatibility.
+        /// Queue a simple message.
         /// </summary>
+        public void QueueMessage(string message, string source = "console", string testCaseId = null)
+        {
+            QueueMessage(message, source, testCaseId, DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ"));
+        }
+
         public void QueueMessage(string message, string source, string testCaseId, string timestamp)
         {
             QueueLogMessage(message, Environment.MachineName, source, null, testCaseId, timestamp);
         }
 
-        private async Task FlushMessagesForTestCase(string testCaseId)
+        private void QueueLogEntry(string nunitTestId, LogEntry entry)
         {
-            if (string.IsNullOrEmpty(testCaseId)) return;
+            string tcId = nunitTestId ?? "global";
 
-            // CRITICAL: Wait for any in-flight SendLogBatch operations to complete
-            // This ensures messages queued by QueueLogMessage are actually sent before we collect remaining messages
-            var sendLock = _testCaseSendLocks.GetOrAdd(testCaseId, _ => new SemaphoreSlim(1, 1));
-            await sendLock.WaitAsync();
-            try
+            var eventData = new Dictionary<string, object>
             {
-                // Give a small moment for any queued SendLogBatch tasks to complete
-                await Task.Delay(10);
-            }
-            finally
+                { "event_type", "log_batch" },
+                { "tc_id", tcId },
+                { "entries", new List<LogEntry> { entry } }
+            };
+
+            var batchEvent = new BatchEvent
             {
-                sendLock.Release();
-            }
+                EventType = "log_batch",
+                Data = eventData,
+                TestCaseId = tcId,
+                LogEntry = entry
+            };
 
-            var messages = new List<LogEntry>();
-            var remainingMessages = new List<LogEntry>();
+            QueueEvent(batchEvent);
+        }
 
-            // Collect all messages for this test case
-            while (_messageQueue.TryDequeue(out var message))
+        private void QueueEvent(BatchEvent evt)
+        {
+            _eventQueue.Enqueue(evt);
+
+            // Estimate size and trigger flush if buffer is getting large
+            var estimatedSize = Interlocked.Add(ref _estimatedBatchSize, EstimateEventSize(evt));
+            if (estimatedSize >= MaxBatchSizeBytes)
             {
-                if (message.testCaseId == testCaseId)
-                {
-                    messages.Add(message);
-                }
-                else
-                {
-                    remainingMessages.Add(message);
-                }
-            }
-
-            // Put back messages that don't belong to this test case
-            foreach (var message in remainingMessages)
-            {
-                _messageQueue.Enqueue(message);
-            }
-
-            // Send all messages for this test case
-            if (messages.Count > 0)
-            {
-                // Use NUnit test ID directly as tc_id
-                string tcId = testCaseId;
-                if (string.IsNullOrEmpty(tcId))
-                {
-                    ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty in FlushMessagesForTestCase");
-                    // Put messages back in queue
-                    foreach (var message in messages)
-                    {
-                        _messageQueue.Enqueue(message);
-                    }
-                    return;
-                }
-
-                var data = new
-                {
-                    type = "log_batch",
-                    run_id = _runId,
-                    tc_id = tcId,
-                    entries = messages
-                };
-
-                await SendWebSocketMessage(data);
+                // Fire and forget async flush
+                _ = Task.Run(async () => await FlushBatchAsync());
             }
         }
 
+        private static int EstimateEventSize(BatchEvent evt)
+        {
+            // Rough estimate: base overhead + message content
+            int size = 100; // Base JSON overhead
+            if (evt.LogEntry != null)
+            {
+                size += (evt.LogEntry.message?.Length ?? 0) + (evt.LogEntry.component?.Length ?? 0) + 50;
+            }
+            else if (evt.Data != null)
+            {
+                size += 200; // Estimated size for other event types
+            }
+            return size;
+        }
+
+        private void OnBatchTimerTick(object state)
+        {
+            // Don't block the timer thread - use a dedicated task
+            _ = Task.Run(async () => await FlushBatchAsync());
+        }
+
+        private void OnHeartbeatTimerTick(object state)
+        {
+            // Send heartbeat if no message has been sent recently
+            _ = Task.Run(async () => await SendHeartbeatIfNeededAsync());
+        }
+
+        /// <summary>
+        /// Send a heartbeat message to keep the connection alive.
+        /// </summary>
+        private async Task SendHeartbeatIfNeededAsync()
+        {
+            if (string.IsNullOrEmpty(_runId)) return;
+            if (_webSocket?.State != WebSocketState.Open) return;
+
+            var timeSinceLastSend = DateTime.UtcNow - _lastSendTime;
+            if (timeSinceLastSend.TotalMilliseconds < HeartbeatIntervalMs - 1000)
+            {
+                // Recent activity, no heartbeat needed
+                return;
+            }
+
+            try
+            {
+                var heartbeat = new { type = "heartbeat", run_id = _runId };
+                await SendWebSocketMessage(heartbeat);
+                ThreadSafeFileLogger.Log($"Heartbeat sent (last activity {timeSinceLastSend.TotalSeconds:F1}s ago)");
+            }
+            catch (Exception ex)
+            {
+                ThreadSafeFileLogger.LogWebSocketException("Heartbeat", ex);
+            }
+        }
+
+        /// <summary>
+        /// Flush all pending events as a batch message.
+        /// </summary>
+        public async Task FlushBatchAsync()
+        {
+            if (_eventQueue.IsEmpty || string.IsNullOrEmpty(_runId)) return;
+
+            await _sendSemaphore.WaitAsync();
+            try
+            {
+                // Collect all events (up to max)
+                var events = new List<object>();
+                var logBatches = new Dictionary<string, List<LogEntry>>();
+
+                int count = 0;
+                while (_eventQueue.TryDequeue(out var evt) && count < MaxEventsPerBatch)
+                {
+                    count++;
+
+                    // Consolidate log entries for the same test case
+                    if (evt.EventType == "log_batch" && evt.LogEntry != null)
+                    {
+                        var tcId = evt.TestCaseId ?? "global";
+                        if (!logBatches.TryGetValue(tcId, out var entries))
+                        {
+                            entries = new List<LogEntry>();
+                            logBatches[tcId] = entries;
+                        }
+                        entries.Add(evt.LogEntry);
+                    }
+                    else
+                    {
+                        events.Add(evt.Data);
+                    }
+                }
+
+                // Add consolidated log batches
+                foreach (var kvp in logBatches)
+                {
+                    events.Add(new Dictionary<string, object>
+                    {
+                        { "event_type", "log_batch" },
+                        { "tc_id", kvp.Key },
+                        { "entries", kvp.Value }
+                    });
+                }
+
+                Interlocked.Exchange(ref _estimatedBatchSize, 0);
+
+                if (events.Count == 0) return;
+
+                var batchMessage = new
+                {
+                    type = "batch",
+                    run_id = _runId,
+                    events = events
+                };
+
+                await SendWebSocketMessageDirect(batchMessage);
+                _lastSendTime = DateTime.UtcNow;
+            }
+            finally
+            {
+                _sendSemaphore.Release();
+            }
+        }
+
+        /// <summary>
+        /// Flush events for a specific test case (used before test_case_finished).
+        /// </summary>
+        private async Task FlushEventsForTestCaseAsync(string nunitTestId)
+        {
+            if (string.IsNullOrEmpty(nunitTestId)) return;
+
+            // First do a general flush to clear the queue
+            await FlushBatchAsync();
+
+            // Small delay to allow any in-flight operations
+            await Task.Delay(10);
+        }
+
         private async Task SendWebSocketMessage(object data)
+        {
+            await _sendSemaphore.WaitAsync();
+            try
+            {
+                await SendWebSocketMessageDirect(data);
+                _lastSendTime = DateTime.UtcNow;
+            }
+            finally
+            {
+                _sendSemaphore.Release();
+            }
+        }
+
+        private async Task SendWebSocketMessageDirect(object data)
         {
             var messageType = GetMessageType(data);
             var messageId = Interlocked.Increment(ref _messageSequence);
@@ -733,12 +810,7 @@ namespace TestRift.NUnit
             byte[] bytes;
             try
             {
-                // Configure serializer to ignore null values
-                var options = new JsonSerializerOptions
-                {
-                    DefaultIgnoreCondition = System.Text.Json.Serialization.JsonIgnoreCondition.WhenWritingNull
-                };
-                json = JsonSerializer.Serialize(data, options);
+                json = JsonSerializer.Serialize(data, _jsonOptions);
                 bytes = Encoding.UTF8.GetBytes(json);
             }
             catch (Exception ex)
@@ -749,162 +821,56 @@ namespace TestRift.NUnit
 
             ThreadSafeFileLogger.LogSendStarting(messageId, messageType, DescribeSocketState());
 
-            await _sendSemaphore.WaitAsync();
             try
             {
-                // Double-check state after acquiring lock
                 if (_webSocket?.State != WebSocketState.Open)
                 {
                     ThreadSafeFileLogger.LogWebSocketNotOpen(DescribeSocketState());
-                    ThreadSafeFileLogger.LogSendFailed($"Send[{messageId}] skipped after lock (type={messageType})");
                     return;
                 }
 
                 await _webSocket.SendAsync(new ArraySegment<byte>(bytes), WebSocketMessageType.Text, true, CancellationToken.None);
                 ThreadSafeFileLogger.LogSendCompleted(messageId, messageType, bytes.Length);
-                ThreadSafeFileLogger.LogMessageSent(json.Substring(0, Math.Min(100, json.Length)) + "...");
             }
             catch (Exception ex)
             {
                 ThreadSafeFileLogger.LogSendFailed(ex.Message);
                 ThreadSafeFileLogger.LogWebSocketException($"Send[{messageId}] ({messageType})", ex);
-                ThreadSafeFileLogger.LogWebSocketStateDetails($"Send[{messageId}] failure", _webSocket?.State, _webSocket?.CloseStatus, _webSocket?.CloseStatusDescription);
-            }
-            finally
-            {
-                _sendSemaphore.Release();
             }
         }
-
-        private async Task SendLogBatch(string nunitTestId)
-        {
-            if (_messageQueue.IsEmpty) return;
-
-            // Use NUnit test ID directly as tc_id
-            string tcId = nunitTestId;
-            if (string.IsNullOrEmpty(tcId))
-            {
-                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"tc_id (NUnit test ID) is empty for test case");
-                return;
-            }
-
-            var messages = new List<LogEntry>();
-            var remainingMessages = new List<LogEntry>();
-
-            // Collect messages for this specific test case
-            while (_messageQueue.TryDequeue(out var message))
-            {
-                if (message.testCaseId == nunitTestId)
-                {
-                    messages.Add(message);
-                }
-                else
-                {
-                    remainingMessages.Add(message);
-                }
-            }
-
-            // Put back messages that don't belong to this test case
-            foreach (var message in remainingMessages)
-            {
-                _messageQueue.Enqueue(message);
-            }
-
-            if (messages.Count == 0) return;
-
-            var data = new
-            {
-                type = "log_batch",
-                run_id = _runId,
-                tc_id = tcId,
-                entries = messages
-            };
-
-            await SendWebSocketMessage(data);
-        }
-
-        private async void SendBatchedMessages(object state)
-        {
-            // This method is called by the timer for general console output
-            // Individual test case output is sent immediately
-            await FlushAllMessagesAsync();
-        }
-
 
         /// <summary>
-        /// Flushes all pending messages and waits for completion
+        /// Flushes all pending messages and waits for completion.
         /// </summary>
         public async Task FlushAllMessagesAsync()
         {
-            await _flushSemaphore.WaitAsync();
-            try
-            {
-                _isFlushing = true;
-
-                var messages = new List<LogEntry>();
-                while (_messageQueue.TryDequeue(out var message))
-                {
-                    messages.Add(message);
-                }
-
-                if (messages.Count > 0)
-                {
-                var data = new
-                {
-                    event_type = "log_batch",
-                    run_id = _runId,
-                    logs = messages
-                };
-
-                    await SendWebSocketMessage(data);
-                }
-            }
-            finally
-            {
-                _isFlushing = false;
-                _flushSemaphore.Release();
-            }
+            await FlushBatchAsync();
         }
 
         /// <summary>
-        /// Waits for all pending operations to complete
-        /// </summary>
-        public async Task WaitForFlushCompleteAsync()
-        {
-            await _flushSemaphore.WaitAsync();
-            try
-            {
-                // Wait for any ongoing flush to complete
-                while (_isFlushing)
-                {
-                    await Task.Delay(10);
-                }
-            }
-            finally
-            {
-                _flushSemaphore.Release();
-            }
-        }
-
-        /// <summary>
-        /// Flushes all messages and waits for completion synchronously
+        /// Flushes all messages synchronously.
         /// </summary>
         public void FlushAllMessages()
         {
-            FlushAllMessagesAsync().Wait();
+            FlushBatchAsync().Wait();
         }
 
         /// <summary>
-        /// Uploads an attachment for a test case (synchronous version)
+        /// Waits for pending operations to complete.
+        /// </summary>
+        public async Task WaitForFlushCompleteAsync()
+        {
+            await FlushBatchAsync();
+        }
+
+        /// <summary>
+        /// Uploads an attachment for a test case (synchronous version).
         /// </summary>
         public bool UploadAttachment(string nunitTestId, string filePath, string description = null)
         {
             return UploadAttachmentAsync(nunitTestId, filePath, description).GetAwaiter().GetResult();
         }
 
-        /// <summary>
-        /// Writes a URL to a file. Creates the directory if it doesn't exist.
-        /// </summary>
         private void WriteUrlFile(string filePath, string url)
         {
             try
@@ -924,7 +890,7 @@ namespace TestRift.NUnit
         }
 
         /// <summary>
-        /// Uploads an attachment for a test case
+        /// Uploads an attachment for a test case.
         /// </summary>
         public async Task<bool> UploadAttachmentAsync(string nunitTestId, string filePath, string description = null)
         {
@@ -936,8 +902,6 @@ namespace TestRift.NUnit
                     return false;
                 }
 
-                // Lookup the tc_id for this test case
-                // Lookup the tc_id (try NUnit test ID first, then full name)
                 string tcId = GetTcIdFromTestId(nunitTestId) ?? GetTcIdFromFullName(nunitTestId);
                 if (tcId == null)
                 {
@@ -989,53 +953,78 @@ namespace TestRift.NUnit
 #endif
         }
 
+        /// <summary>
+        /// Gracefully close the WebSocket connection with a normal close handshake.
+        /// Should be called after SendRunFinished() to ensure the server receives all messages.
+        /// </summary>
+        public async Task CloseAsync()
+        {
+            if (_webSocket != null && _webSocket.State == WebSocketState.Open)
+            {
+                try
+                {
+                    ThreadSafeFileLogger.Log("Initiating graceful WebSocket close");
+                    using var cts = new CancellationTokenSource(TimeSpan.FromSeconds(5));
+                    await _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Run finished", cts.Token);
+                    ThreadSafeFileLogger.Log("WebSocket closed gracefully");
+                }
+                catch (OperationCanceledException)
+                {
+                    ThreadSafeFileLogger.Log("WebSocket close timed out after 5 seconds");
+                }
+                catch (Exception ex)
+                {
+                    ThreadSafeFileLogger.Log($"Error during WebSocket close: {ex.Message}");
+                }
+            }
+        }
+
         public void Dispose()
         {
             if (!_disposed)
             {
                 StopPassiveReceiveLoop();
                 _batchTimer?.Dispose();
+                _heartbeatTimer?.Dispose();
                 ThreadSafeFileLogger.Log("Disposing WebSocketHelper");
                 if (_webSocket != null)
                 {
                     ThreadSafeFileLogger.LogWebSocketStateDetails("Dispose", _webSocket.State, _webSocket.CloseStatus, _webSocket.CloseStatusDescription);
+                    // Try graceful close if still open
+                    if (_webSocket.State == WebSocketState.Open)
+                    {
+                        try
+                        {
+                            ThreadSafeFileLogger.Log("Attempting graceful close during Dispose");
+                            _webSocket.CloseAsync(WebSocketCloseStatus.NormalClosure, "Disposing", CancellationToken.None)
+                                .GetAwaiter().GetResult();
+                        }
+                        catch (Exception ex)
+                        {
+                            ThreadSafeFileLogger.Log($"Graceful close failed during Dispose: {ex.Message}");
+                        }
+                    }
                 }
                 _webSocket?.Dispose();
                 _httpClient?.Dispose();
-                _flushSemaphore?.Dispose();
                 _sendSemaphore?.Dispose();
-
-                // Dispose all per-test-case locks
-                foreach (var kvp in _testCaseSendLocks)
-                {
-                    kvp.Value?.Dispose();
-                }
-                _testCaseSendLocks.Clear();
-
                 _disposed = true;
             }
         }
 
         private static string GetMessageType(object data)
         {
-            if (data == null)
-            {
-                return "null";
-            }
+            if (data == null) return "null";
 
             if (data is IDictionary<string, object> dict && dict.TryGetValue("type", out var value) && value != null)
-            {
                 return value.ToString();
-            }
 
             var typeProperty = data.GetType().GetProperty("type");
             if (typeProperty != null)
             {
                 var propertyValue = typeProperty.GetValue(data);
                 if (propertyValue != null)
-                {
                     return propertyValue.ToString();
-                }
             }
 
             return "unknown";
@@ -1043,15 +1032,23 @@ namespace TestRift.NUnit
 
         private string DescribeSocketState()
         {
-            if (_webSocket == null)
-            {
-                return "null";
-            }
+            if (_webSocket == null) return "null";
 
             var closeStatus = _webSocket.CloseStatus?.ToString() ?? "null";
             var closeDescription = _webSocket.CloseStatusDescription ?? "null";
             return $"State={_webSocket.State}, CloseStatus={closeStatus}, CloseDescription={closeDescription}";
         }
+    }
+
+    /// <summary>
+    /// Internal class representing a queued event for batching.
+    /// </summary>
+    internal class BatchEvent
+    {
+        public string EventType { get; set; }
+        public Dictionary<string, object> Data { get; set; }
+        public string TestCaseId { get; set; }
+        public LogEntry LogEntry { get; set; }  // For log_batch events, store the entry directly
     }
 
     /// <summary>
@@ -1063,10 +1060,7 @@ namespace TestRift.NUnit
         public string message { get; set; }
         public string component { get; set; }
         public string channel { get; set; }
-        public string dir { get; set; }  // Only included if not null
-        public string phase { get; set; }  // Only included if not null
-        // Note: testCaseId is NOT included - it's only used internally for routing
-        [JsonIgnore]
-        public string testCaseId { get; set; }  // Internal use only for routing messages
+        public string dir { get; set; }
+        public string phase { get; set; }
     }
 }
