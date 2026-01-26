@@ -27,6 +27,7 @@ namespace TestRift.NUnit
         public const int MSG_RUN_FINISHED = 7;
         public const int MSG_BATCH = 8;
         public const int MSG_HEARTBEAT = 9;
+        public const int MSG_METRICS = 11;
 
         // Status codes (s field)
         public const int STATUS_RUNNING = 1;
@@ -70,6 +71,13 @@ namespace TestRift.NUnit
         public const string F_RUN_URL = "ru";
         public const string F_GROUP_URL = "gu";
         public const string F_GROUP_HASH = "gh";
+
+        // Metrics fields
+        public const string F_METRICS = "mt";
+        public const string F_CPU = "cpu";
+        public const string F_MEMORY = "mem";
+        public const string F_NET = "net";
+        public const string F_NET_INTERFACES = "ni";
 
         /// <summary>Unix epoch for timestamp calculations.</summary>
         private static readonly DateTime UnixEpoch = new DateTime(1970, 1, 1, 0, 0, 0, DateTimeKind.Utc);
@@ -168,6 +176,8 @@ namespace TestRift.NUnit
         }
         private readonly Timer _batchTimer;
         private readonly Timer _heartbeatTimer;
+        private readonly Timer _metricsTimer;
+        private readonly SystemMetricsCollector _metricsCollector;
         private bool _disposed = false;
         private readonly SemaphoreSlim _sendSemaphore = new SemaphoreSlim(1, 1);
         private readonly HttpClient _httpClient;
@@ -216,6 +226,12 @@ namespace TestRift.NUnit
             // Initialize heartbeat timer to keep connection alive during idle periods
             _heartbeatTimer = new Timer(OnHeartbeatTimerTick, null, HeartbeatIntervalMs, HeartbeatIntervalMs);
 
+            // Initialize metrics collector (starts when run starts)
+            _metricsCollector = new SystemMetricsCollector(1000);
+
+            // Initialize metrics timer (sends every 5 seconds to batch samples)
+            _metricsTimer = new Timer(OnMetricsTimerTick, null, Timeout.Infinite, Timeout.Infinite);
+
             _httpClient = new HttpClient();
         }
 
@@ -262,6 +278,9 @@ namespace TestRift.NUnit
             await SendWebSocketMessage(dataDict);
             await WaitForRunStartedResponse();
             StartPassiveReceiveLoop();
+
+            // Start metrics collection after successful connection
+            StartMetricsCollection();
         }
 
         private string GetRunName()
@@ -516,6 +535,10 @@ namespace TestRift.NUnit
 
         public async Task SendRunFinished()
         {
+            // Stop metrics collection and send final batch
+            StopMetricsCollection();
+            await FlushMetricsAsync();
+
             // Flush all pending events before finishing
             await FlushBatchAsync();
 
@@ -853,6 +876,105 @@ namespace TestRift.NUnit
             }
         }
 
+        private void OnMetricsTimerTick(object state)
+        {
+            _ = Task.Run(async () => await FlushMetricsAsync());
+        }
+
+        /// <summary>
+        /// Start system metrics collection.
+        /// </summary>
+        private void StartMetricsCollection()
+        {
+            try
+            {
+                _metricsCollector.Start();
+                // Send metrics every 5 seconds (batches 5 samples)
+                _metricsTimer.Change(5000, 5000);
+                ThreadSafeFileLogger.Log("Metrics collection started");
+            }
+            catch (Exception ex)
+            {
+                ThreadSafeFileLogger.Log($"Failed to start metrics collection: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Stop system metrics collection.
+        /// </summary>
+        private void StopMetricsCollection()
+        {
+            try
+            {
+                _metricsTimer.Change(Timeout.Infinite, Timeout.Infinite);
+                _metricsCollector.Stop();
+                ThreadSafeFileLogger.Log("Metrics collection stopped");
+            }
+            catch (Exception ex)
+            {
+                ThreadSafeFileLogger.Log($"Error stopping metrics collection: {ex.Message}");
+            }
+        }
+
+        /// <summary>
+        /// Flush collected metrics samples to the server.
+        /// </summary>
+        private async Task FlushMetricsAsync()
+        {
+            if (string.IsNullOrEmpty(_runId)) return;
+            if (_webSocket?.State != WebSocketState.Open) return;
+
+            try
+            {
+                var samples = _metricsCollector.DrainSamples();
+                if (samples.Length == 0) return;
+
+                var metricsList = new List<Dictionary<string, object>>();
+                foreach (var sample in samples)
+                {
+                    var sampleDict = new Dictionary<string, object>
+                    {
+                        { Protocol.F_TIMESTAMP, sample.TimestampMs },
+                        { Protocol.F_CPU, sample.CpuPercent },
+                        { Protocol.F_MEMORY, sample.MemoryPercent },
+                        { Protocol.F_NET, sample.NetPercent }
+                    };
+
+                    // Include per-interface details if available
+                    if (sample.NetworkInterfaces != null && sample.NetworkInterfaces.Length > 0)
+                    {
+                        var niList = new List<Dictionary<string, object>>();
+                        foreach (var ni in sample.NetworkInterfaces)
+                        {
+                            niList.Add(new Dictionary<string, object>
+                            {
+                                { "n", ni.Name },
+                                { "tx", ni.TxPercent },
+                                { "rx", ni.RxPercent }
+                            });
+                        }
+                        sampleDict[Protocol.F_NET_INTERFACES] = niList;
+                    }
+
+                    metricsList.Add(sampleDict);
+                }
+
+                var metricsMsg = new Dictionary<string, object>
+                {
+                    { Protocol.F_TYPE, Protocol.MSG_METRICS },
+                    { Protocol.F_RUN_ID, _runId },
+                    { Protocol.F_METRICS, metricsList }
+                };
+
+                await SendWebSocketMessage(metricsMsg);
+                ThreadSafeFileLogger.Log($"Sent {samples.Length} metrics samples");
+            }
+            catch (Exception ex)
+            {
+                ThreadSafeFileLogger.LogWebSocketException("FlushMetrics", ex);
+            }
+        }
+
         /// <summary>
         /// Flush all pending events as a batch message.
         /// </summary>
@@ -1164,6 +1286,8 @@ namespace TestRift.NUnit
             if (!_disposed)
             {
                 StopPassiveReceiveLoop();
+                _metricsCollector?.Dispose();
+                _metricsTimer?.Dispose();
                 _batchTimer?.Dispose();
                 _heartbeatTimer?.Dispose();
                 ThreadSafeFileLogger.Log("Disposing WebSocketHelper");
