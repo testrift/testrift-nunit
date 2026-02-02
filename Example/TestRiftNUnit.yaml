@@ -42,3 +42,10 @@ urlFiles:
   runUrlFile: test_run_url.txt
   # Path to write the group runs URL (optional, only written if run belongs to a group)
   groupUrlFile: test_group_url.txt
+
+# Collector configuration for tracking code changes
+collector:
+  repos:
+    - name: testrift-nunit
+      url: https://github.com/testrift/testrift-nunit
+      path: ..

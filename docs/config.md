@@ -97,9 +97,26 @@ Given:
 - `serverUrl: http://localhost:8080`
 - `runId: my-run-123`
 
-the run URL will be:
-
 - `http://localhost:8080/testRun/my-run-123/index.html`
+
+#### Environment variable: `TESTRIFT_PREPARED_RUN_ID`
+
+Activate a prepared run instead of starting a new one.
+
+- When the `TESTRIFT_PREPARED_RUN_ID` environment variable is set, the plugin sends `run_started` with this run ID to activate a run that was prepared by `testrift-collector`.
+- The prepared run must exist on the server (prepared within the last 15 minutes).
+- This is **not a YAML config field** - it's only read from the environment variable.
+
+Example workflow:
+
+```bash
+# testrift-collector prepares the run and prints the run_id
+RUN_ID=$(testrift-collector -c TestRiftNUnit.yaml)
+
+# Pass the run_id to NUnit via environment variable
+export TESTRIFT_PREPARED_RUN_ID=$RUN_ID
+dotnet test
+```
 
 #### `metadata` (optional)
 
@@ -149,6 +166,44 @@ Behavior:
 - The file contents are the full absolute URL, built from `serverUrl` plus the relative URL returned by the server.
 
 This is useful in CI to publish a link to results without parsing logs.
+
+#### `collector` (optional)
+
+Configuration for `testrift-collector` to collect git diffs between test runs.
+
+This section is read by `testrift-collector` (not by the NUnit plugin) but is placed in the same YAML file for convenience.
+
+```yaml
+collector:
+  repos:
+    - name: my-app
+      url: https://github.com/org/my-app
+      path: ../my-app
+    - name: firmware
+      url: https://github.com/org/firmware
+      gitUrl: https://github.com/org/firmware.git
+      ref: ${env:FIRMWARE_SHA}
+```
+
+##### `collector.repos` (required)
+
+List of repositories to collect diffs from.
+
+Each repo entry has the following fields:
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `name` | Yes | Unique name for the repository (used as key in diff storage) |
+| `url` | No | User-facing URL for linking in the UI |
+| `path` | Conditional | Local filesystem path to the git repository |
+| `gitUrl` | Conditional | Git remote URL (use with `ref`) |
+| `ref` | Conditional | Branch, tag, or SHA (required when using `gitUrl`) |
+
+**Note:** Each repo must specify either `path` OR `gitUrl` + `ref`, not both.
+
+All fields support `${env:VAR_NAME}` expansion.
+
+See [`testrift-collector` documentation](../../testrift-collector/README.md) for more details.
 
 ### Protocol mapping
 

@@ -105,6 +105,7 @@ namespace TestRift.NUnit
 
                 var deserializer = new DeserializerBuilder()
                     .WithNamingConvention(CamelCaseNamingConvention.Instance)
+                    .IgnoreUnmatchedProperties()
                     .Build();
 
                 var cfg = deserializer.Deserialize<Config>(yamlText);

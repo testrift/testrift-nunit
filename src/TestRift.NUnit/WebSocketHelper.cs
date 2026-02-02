@@ -256,6 +256,9 @@ namespace TestRift.NUnit
 
         public async Task SendRunStarted()
         {
+            // Check if we're activating a prepared run (from testrift-collector)
+            var preparedRunId = GetPreparedRunId();
+
             var runId = GetRunId();
             var runName = GetRunName();
             var timestamp = Protocol.NowMs();
@@ -270,7 +273,14 @@ namespace TestRift.NUnit
                 { Protocol.F_USER_METADATA, userMetadata },
                 { Protocol.F_GROUP, groupData }
             };
-            if (!string.IsNullOrEmpty(runId))
+
+            // If we have a prepared run ID, use it to activate the prepared run
+            if (!string.IsNullOrEmpty(preparedRunId))
+            {
+                dataDict[Protocol.F_RUN_ID] = preparedRunId;
+                ThreadSafeFileLogger.LogMessageSent($"Activating prepared run: {preparedRunId}");
+            }
+            else if (!string.IsNullOrEmpty(runId))
             {
                 dataDict[Protocol.F_RUN_ID] = runId;
             }
@@ -281,6 +291,12 @@ namespace TestRift.NUnit
 
             // Start metrics collection after successful connection
             StartMetricsCollection();
+        }
+
+        private string GetPreparedRunId()
+        {
+            // Read from environment variable only (not from config file)
+            return Environment.GetEnvironmentVariable("TESTRIFT_PREPARED_RUN_ID");
         }
 
         private string GetRunName()
