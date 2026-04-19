@@ -50,8 +50,8 @@ echo Running example tests...
 echo Make sure the TestRift Server is running on http://localhost:8080
 echo.
 
-REM Run the example tests
-dotnet test --logger "console;verbosity=normal"
+REM Run the example tests with parallel execution enabled
+dotnet test --settings .runsettings --logger "console;verbosity=normal"
 
 echo.
 echo Tests completed. Check the Test Log Server for results.

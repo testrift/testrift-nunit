@@ -8,6 +8,7 @@
 - Run metadata (`metadata`)
 - Grouping (`group`)
 - Optional URL file generation for CI (`urlFiles`)
+- AI failure analysis preferences (`aiAnalysis`, `aiEmail`, `aiEmailTo`)
 
 ### How the config file is discovered
 
@@ -162,6 +163,25 @@ Behavior:
 - Files are written after the server replies to `run_started` (so the final `run_id` and group hash are known).
 - Paths support `${env:VAR_NAME}` expansion.
 - `runUrlFile` is written if configured.
+
+### AI failure analysis preferences
+
+Optional fields to control AI failure analysis behavior per run:
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `aiAnalysis` | `string` | `"auto"` (run automatically), `"manual"` (trigger from UI), `"off"` (disabled) |
+| `aiEmail` | `string` | `"auto"` (send email after analysis), `"manual"`, `"off"` |
+| `aiEmailTo` | `list[string]` | Override email recipients for this run |
+
+When omitted, the server's own config determines behavior.
+
+```yaml
+aiAnalysis: auto
+aiEmail: auto
+aiEmailTo:
+  - team@example.com
+```
 - `groupUrlFile` is written only if the run belongs to a group (server returns `group_url`).
 - The file contents are the full absolute URL, built from `serverUrl` plus the relative URL returned by the server.
 

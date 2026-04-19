@@ -72,6 +72,11 @@ namespace TestRift.NUnit
         public const string F_GROUP_URL = "gu";
         public const string F_GROUP_HASH = "gh";
 
+        // AI analysis fields
+        public const string F_AI_ANALYSIS = "aa";
+        public const string F_AI_EMAIL = "ae";
+        public const string F_AI_EMAIL_TO = "er";
+
         // Metrics fields
         public const string F_METRICS = "mt";
         public const string F_CPU = "cpu";
@@ -274,6 +279,11 @@ namespace TestRift.NUnit
                 { Protocol.F_GROUP, groupData }
             };
 
+            // Add AI analysis preferences if configured
+            var aiFields = GetAiAnalysisFields();
+            foreach (var kvp in aiFields)
+                dataDict[kvp.Key] = kvp.Value;
+
             // If we have a prepared run ID, use it to activate the prepared run
             if (!string.IsNullOrEmpty(preparedRunId))
             {
@@ -323,6 +333,40 @@ namespace TestRift.NUnit
             {
                 return null;
             }
+        }
+
+        private Dictionary<string, object> GetAiAnalysisFields()
+        {
+            var fields = new Dictionary<string, object>();
+            try
+            {
+                var config = ConfigManager.Get();
+                if (!string.IsNullOrEmpty(config.AiAnalysis))
+                    fields[Protocol.F_AI_ANALYSIS] = MapAiPreference(config.AiAnalysis);
+                if (!string.IsNullOrEmpty(config.AiEmail))
+                    fields[Protocol.F_AI_EMAIL] = MapAiPreference(config.AiEmail);
+                if (config.AiEmailTo != null && config.AiEmailTo.Count > 0)
+                    fields[Protocol.F_AI_EMAIL_TO] = config.AiEmailTo;
+            }
+            catch
+            {
+                // Config not loaded — skip
+            }
+            return fields;
+        }
+
+        /// <summary>
+        /// Maps string preference values to the integer protocol values.
+        /// "auto" → 1, "off" → 2, "manual" or anything else → 0 (default/server decides).
+        /// </summary>
+        private static int MapAiPreference(string value)
+        {
+            return value?.ToLowerInvariant() switch
+            {
+                "auto" => 1,
+                "off" => 2,
+                _ => 0
+            };
         }
 
         private async Task WaitForRunStartedResponse()

@@ -4,7 +4,7 @@
 serverUrl: http://localhost:8080
 
 autoStartServer:
-  enabled: true
+  enabled: false
   serverYaml: TestRiftServer.yaml
   restartOnConfigChange: true
 
@@ -48,4 +48,14 @@ collector:
   repos:
     - name: testrift-nunit
       url: https://github.com/testrift/testrift-nunit
+
+# AI failure analysis preferences (optional)
+# These settings control the server's AI analysis behavior for this test run.
+# aiAnalysis: auto | manual | off (default: uses server config)
+# aiEmail: auto | manual | off (default: uses server config)
+# aiEmailTo: list of email addresses to override server defaults
+#aiAnalysis: auto
+#aiEmail: auto
+#aiEmailTo:
+#  - team@example.com
       path: ..
