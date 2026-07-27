@@ -64,13 +64,19 @@ namespace TestRift.NUnit
         public const string F_STACK_TRACE = "st";
         public const string F_IS_ERROR = "ie";
         public const string F_USER_METADATA = "md";
-        public const string F_GROUP = "g";
         public const string F_RETENTION_DAYS = "rd";
         public const string F_LOCAL_RUN = "lr";
         public const string F_ERROR = "err";
         public const string F_RUN_URL = "ru";
-        public const string F_GROUP_URL = "gu";
-        public const string F_GROUP_HASH = "gh";
+        public const string F_TARGET_KEY = "tk";
+        public const string F_PURPOSE = "pu";
+        public const string F_PARENT_RUN_ID = "pr";
+        public const string F_SOURCES = "so";
+        public const string F_SOURCE_BRANCH = "br";
+        public const string F_SOURCE_REVISION = "rv";
+        public const string F_SOURCE_REPOSITORY_URL = "repo";
+        public const string F_SOURCE_DIRTY = "dy";
+        public const string F_TARGET_URL = "tu";
 
         // AI analysis fields
         public const string F_AI_ANALYSIS = "aa";
@@ -268,21 +274,13 @@ namespace TestRift.NUnit
             var runName = GetRunName();
             var timestamp = Protocol.NowMs();
             var userMetadata = GetUserMetadata();
-            var groupData = GetGroupData();
-
             var dataDict = new Dictionary<string, object>
             {
                 { Protocol.F_TYPE, Protocol.MSG_RUN_STARTED },
                 { Protocol.F_RUN_NAME, runName },
                 { Protocol.F_TIMESTAMP, timestamp },
-                { Protocol.F_USER_METADATA, userMetadata },
-                { Protocol.F_GROUP, groupData }
+                { Protocol.F_USER_METADATA, userMetadata }
             };
-
-            // Add AI analysis preferences if configured
-            var aiFields = GetAiAnalysisFields();
-            foreach (var kvp in aiFields)
-                dataDict[kvp.Key] = kvp.Value;
 
             // If we have a prepared run ID, use it to activate the prepared run
             if (!string.IsNullOrEmpty(preparedRunId))
@@ -293,6 +291,16 @@ namespace TestRift.NUnit
             else if (!string.IsNullOrEmpty(runId))
             {
                 dataDict[Protocol.F_RUN_ID] = runId;
+            }
+
+            if (string.IsNullOrEmpty(preparedRunId))
+            {
+                var context = GetRunContext();
+                dataDict[Protocol.F_TARGET_KEY] = context.Target;
+                dataDict[Protocol.F_PURPOSE] = context.Purpose;
+                dataDict[Protocol.F_SOURCES] = context.Sources;
+                if (!string.IsNullOrEmpty(context.ParentRunId))
+                    dataDict[Protocol.F_PARENT_RUN_ID] = context.ParentRunId;
             }
 
             await SendWebSocketMessage(dataDict);
@@ -510,7 +518,7 @@ namespace TestRift.NUnit
                 if (config.UrlFiles == null) return;
 
                 var runUrlFile = config.UrlFiles.RunUrlFile;
-                var groupUrlFile = config.UrlFiles.GroupUrlFile;
+                var targetUrlFile = config.UrlFiles.TargetUrlFile;
 
                 if (!string.IsNullOrEmpty(runUrlFile) &&
                     response.TryGetValue(Protocol.F_RUN_URL, out var runUrlObj) &&
@@ -520,12 +528,12 @@ namespace TestRift.NUnit
                     WriteUrlFile(runUrlFile, runUrl);
                 }
 
-                if (!string.IsNullOrEmpty(groupUrlFile) &&
-                    response.TryGetValue(Protocol.F_GROUP_URL, out var groupUrlObj) &&
-                    groupUrlObj != null)
+                if (!string.IsNullOrEmpty(targetUrlFile) &&
+                    response.TryGetValue(Protocol.F_TARGET_URL, out var targetUrlObj) &&
+                    targetUrlObj != null)
                 {
-                    var groupUrl = _serverBaseUrl + groupUrlObj.ToString();
-                    WriteUrlFile(groupUrlFile, groupUrl);
+                    var targetUrl = _serverBaseUrl + targetUrlObj.ToString();
+                    WriteUrlFile(targetUrlFile, targetUrl);
                 }
             }
             catch (Exception ex)
@@ -548,25 +556,25 @@ namespace TestRift.NUnit
             return new Dictionary<string, object>();
         }
 
-        private object GetGroupData()
+        private (string Target, string Purpose, string ParentRunId, Dictionary<string, object> Sources) GetRunContext()
         {
-            try
+            var config = ConfigManager.Get();
+            var sources = new Dictionary<string, object>();
+            foreach (var source in config.Sources)
             {
-                var config = ConfigManager.Get();
-                if (config.Group == null || string.IsNullOrWhiteSpace(config.Group.Name))
-                    return null;
-
-                return new
+                var value = source.Value;
+                var wireSource = new Dictionary<string, object>
                 {
-                    name = config.Group.Name,
-                    metadata = BuildMetadataDictionary(config.Group.Metadata)
+                    { Protocol.F_SOURCE_BRANCH, value.Branch },
+                    { Protocol.F_SOURCE_REVISION, value.Revision },
                 };
+                if (!string.IsNullOrEmpty(value.RepositoryUrl))
+                    wireSource[Protocol.F_SOURCE_REPOSITORY_URL] = value.RepositoryUrl;
+                if (value.Dirty.HasValue)
+                    wireSource[Protocol.F_SOURCE_DIRTY] = value.Dirty.Value;
+                sources[source.Key] = wireSource;
             }
-            catch (Exception ex)
-            {
-                ThreadSafeFileLogger.LogWebSocketConnectionFailed($"Failed to get group metadata: {ex.Message}");
-                return null;
-            }
+            return (config.Target, config.Purpose, config.ParentRunId, sources);
         }
 
         private static Dictionary<string, object> BuildMetadataDictionary(IEnumerable<MetadataEntry> entries)

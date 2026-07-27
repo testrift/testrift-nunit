@@ -14,15 +14,17 @@ namespace TestRift.NUnit
         public string Url { get; set; }
     }
 
-    public class GroupConfig
+    public class SourceConfig
     {
-        public string Name { get; set; } = "";
-        public List<MetadataEntry> Metadata { get; set; } = new();
+        public string Branch { get; set; } = "";
+        public string Revision { get; set; } = "";
+        public string RepositoryUrl { get; set; }
+        public bool? Dirty { get; set; }
     }
 
     /// <summary>
     /// Configuration for URL file generation.
-    /// When set, the NUnit plugin will write the test run or group URL to the specified file path.
+    /// When set, the NUnit plugin will write the test run or Target URL to the specified file path.
     /// This is useful for CI scripts to discover the URL to the test run results.
     /// </summary>
     public class UrlFilesConfig
@@ -33,10 +35,9 @@ namespace TestRift.NUnit
         public string RunUrlFile { get; set; }
 
         /// <summary>
-        /// File path to write the group runs URL. If not set, no URL file is generated.
-        /// Only generated if the test run belongs to a group.
+        /// File path to write the Target URL. If not set, no URL file is generated.
         /// </summary>
-        public string GroupUrlFile { get; set; }
+        public string TargetUrlFile { get; set; }
     }
 
     public class AutoStartServerConfig
@@ -86,7 +87,10 @@ namespace TestRift.NUnit
         public string RunId { get; set; }
 
         public List<MetadataEntry> Metadata { get; set; } = new();
-        public GroupConfig Group { get; set; }
+        public string Target { get; set; }
+        public string Purpose { get; set; } = "manual";
+        public string ParentRunId { get; set; }
+        public Dictionary<string, SourceConfig> Sources { get; set; } = new();
         public UrlFilesConfig UrlFiles { get; set; }
 
         /// <summary>
@@ -141,18 +145,21 @@ namespace TestRift.NUnit
                         entry.Url = VarExpander.Expand(entry.Url);
                 }
 
-                if (cfg.Group != null)
-                {
-                    cfg.Group.Name = VarExpander.Expand(cfg.Group.Name ?? "");
-                    cfg.Group.Metadata ??= new List<MetadataEntry>();
+                cfg.Target = Environment.GetEnvironmentVariable("TESTRIFT_TARGET") ?? cfg.Target;
+                if (!string.IsNullOrEmpty(cfg.Target))
+                    cfg.Target = VarExpander.Expand(cfg.Target);
+                if (!string.IsNullOrEmpty(cfg.Purpose))
+                    cfg.Purpose = VarExpander.Expand(cfg.Purpose);
+                if (!string.IsNullOrEmpty(cfg.ParentRunId))
+                    cfg.ParentRunId = VarExpander.Expand(cfg.ParentRunId);
 
-                    foreach (var entry in cfg.Group.Metadata)
-                    {
-                        entry.Name = VarExpander.Expand(entry.Name);
-                        entry.Value = VarExpander.Expand(entry.Value);
-                        if (entry.Url != null)
-                            entry.Url = VarExpander.Expand(entry.Url);
-                    }
+                cfg.Sources ??= new Dictionary<string, SourceConfig>();
+                foreach (var source in cfg.Sources.Values)
+                {
+                    source.Branch = VarExpander.Expand(source.Branch ?? "");
+                    source.Revision = VarExpander.Expand(source.Revision ?? "");
+                    if (source.RepositoryUrl != null)
+                        source.RepositoryUrl = VarExpander.Expand(source.RepositoryUrl);
                 }
 
                 // Expand run name
@@ -188,8 +195,8 @@ namespace TestRift.NUnit
                 {
                     if (!string.IsNullOrEmpty(cfg.UrlFiles.RunUrlFile))
                         cfg.UrlFiles.RunUrlFile = VarExpander.Expand(cfg.UrlFiles.RunUrlFile);
-                    if (!string.IsNullOrEmpty(cfg.UrlFiles.GroupUrlFile))
-                        cfg.UrlFiles.GroupUrlFile = VarExpander.Expand(cfg.UrlFiles.GroupUrlFile);
+                    if (!string.IsNullOrEmpty(cfg.UrlFiles.TargetUrlFile))
+                        cfg.UrlFiles.TargetUrlFile = VarExpander.Expand(cfg.UrlFiles.TargetUrlFile);
                 }
 
                 _config = cfg;
