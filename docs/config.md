@@ -6,9 +6,8 @@
 - Server connection (`serverUrl`)
 - Run naming (`runName`, optional `runId`)
 - Run metadata (`metadata`)
-- Grouping (`group`)
+- Target Run context (`target`, `purpose`, `sources`, optional `parentRunId`)
 - Optional URL file generation for CI (`urlFiles`)
-- AI failure analysis preferences (`aiAnalysis`, `aiEmail`, `aiEmailTo`)
 
 ### How the config file is discovered
 
@@ -21,7 +20,7 @@ If no config file is found, the plugin uses defaults (server URL defaults to `ht
 
 ### Environment variable expansion
 
-All string fields support `${env:VAR_NAME}` expansion. Missing variables expand to an empty string.
+All string fields support `${env:VAR_NAME}` expansion. A referenced variable must be set; missing variables fail configuration loading.
 
 Example:
 
@@ -130,23 +129,23 @@ metadata:
     url: https://example.com/builds/${env:BUILD_ID}
 ```
 
-#### `group` (optional)
+#### Target Run context (required)
 
-Groups runs together in the UI (group pages, analyzer, matrix):
+Every direct Run requires a canonical Target, a purpose, and at least one source snapshot. Source branches and revisions are exact values used for Summary profile selection.
 
 ```yaml
-group:
-  name: ${env:PRODUCT}
-  metadata:
-    - name: Branch
-      value: ${env:BRANCH}
+target: nora-b26x
+purpose: nightly
+sources:
+  firmware:
+    branch: main
+    revision: ${env:FIRMWARE_REVISION}
+  test-system:
+    branch: development
+    revision: ${env:TEST_SYSTEM_REVISION}
 ```
 
-When `group` is set, the server computes a deterministic group hash. The UI exposes group-scoped pages such as:
-
-- `http://localhost:8080/groups/<group-hash>`
-- `http://localhost:8080/analyzer?group=<group-hash>`
-- `http://localhost:8080/matrix?group=<group-hash>`
+`purpose` is one of `nightly`, `release`, `feature`, `manual`, `sanity`, or `rerun`. `parentRunId` is required only when `purpose: rerun` and rejected for every other purpose. `TESTRIFT_TARGET` overrides the YAML Target.
 
 #### `urlFiles` (optional)
 
@@ -155,35 +154,16 @@ Write URLs to files after the run starts (handy in CI):
 ```yaml
 urlFiles:
   runUrlFile: test_run_url.txt
-  groupUrlFile: test_group_url.txt
+  targetUrlFile: test_target_url.txt
 ```
 
 Behavior:
 
-- Files are written after the server replies to `run_started` (so the final `run_id` and group hash are known).
+- Files are written after the server replies to `run_started`.
 - Paths support `${env:VAR_NAME}` expansion.
 - `runUrlFile` is written if configured.
-
-### AI failure analysis preferences
-
-Optional fields to control AI failure analysis behavior per run:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `aiAnalysis` | `string` | `"auto"` (run automatically), `"manual"` (trigger from UI), `"off"` (disabled) |
-| `aiEmail` | `string` | `"auto"` (send email after analysis), `"manual"`, `"off"` |
-| `aiEmailTo` | `list[string]` | Override email recipients for this run |
-
-When omitted, the server's own config determines behavior.
-
-```yaml
-aiAnalysis: auto
-aiEmail: auto
-aiEmailTo:
-  - team@example.com
-```
-- `groupUrlFile` is written only if the run belongs to a group (server returns `group_url`).
-- The file contents are the full absolute URL, built from `serverUrl` plus the relative URL returned by the server.
+- `targetUrlFile` is written when the server returns a Target URL.
+- URL-file contents are absolute URLs built from `serverUrl` plus the returned relative URL.
 
 This is useful in CI to publish a link to results without parsing logs.
 
@@ -232,7 +212,10 @@ This YAML config influences fields in the `run_started` message:
 - `runName` → `run_name`
 - `runId` → `run_id` (optional)
 - `metadata` → `user_metadata`
-- `group` → `group`
+- `target` → `target_key`
+- `purpose` → `purpose`
+- `parentRunId` → `parent_run_id` (reruns only)
+- `sources` → `sources`
 
 For the complete wire format, see [`websocket_protocol.md`](../../testrift-server/docs/websocket_protocol.md).
 
@@ -247,15 +230,16 @@ metadata:
   - name: Firmware
     value: ${env:FIRMWARE_BRANCH}
 
-group:
-  name: ${env:PRODUCT}
-  metadata:
-    - name: Branch
-      value: ${env:BRANCH}
+target: nora-b26x
+purpose: nightly
+sources:
+  firmware:
+    branch: main
+    revision: ${env:FIRMWARE_REVISION}
 
 urlFiles:
   runUrlFile: test_run_url.txt
-  groupUrlFile: test_group_url.txt
+  targetUrlFile: test_target_url.txt
 ```
 
 

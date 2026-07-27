@@ -1,6 +1,13 @@
 # TestRift NUnit configuration for unit tests
 serverUrl: http://localhost:19999
 
+target: test-target
+purpose: manual
+sources:
+  test-system:
+    branch: main
+    revision: test-revision
+
 autoStartServer:
   enabled: true
   serverYaml: TestRiftServer.yaml

@@ -12,7 +12,10 @@ namespace TestRift.NUnit
             return VarRegex.Replace(input, match =>
             {
                 var name = match.Groups["name"].Value;
-                return Environment.GetEnvironmentVariable(name) ?? "";
+                var value = Environment.GetEnvironmentVariable(name);
+                if (value == null)
+                    throw new InvalidOperationException($"Required environment variable '{name}' is not set.");
+                return value;
             });
         }
     }

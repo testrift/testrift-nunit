@@ -7,6 +7,13 @@ serverUrl: http://localhost:19999
 
 runName: Integration Test Run
 
+target: integration-target
+purpose: manual
+sources:
+  test-system:
+    branch: main
+    revision: integration-revision
+
 metadata:
   - name: Test Type
     value: Integration

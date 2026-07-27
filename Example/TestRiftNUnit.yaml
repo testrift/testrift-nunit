@@ -27,12 +27,15 @@ metadata:
     value: nuts-v2
     url: ${env:TESTSYSTEM_URL}
 
-group:
-  name: ${env:PRODUCT}
-  metadata:
-    - name: Branch
-      value: ${env:BRANCH}
-      url: ${env:TESTSYSTEM_URL}/${env:BRANCH}
+target: nora-b26x
+purpose: nightly
+sources:
+  firmware:
+    branch: ${env:FIRMWARE_BRANCH}
+    revision: ${env:FIRMWARE_REVISION}
+  test-system:
+    branch: main
+    revision: ${env:TESTSYSTEM_REVISION}
 
 # URL file generation for CI scripts
 # When configured, these files are written after the test run starts,
@@ -40,22 +43,6 @@ group:
 urlFiles:
   # Path to write the test run URL (optional)
   runUrlFile: test_run_url.txt
-  # Path to write the group runs URL (optional, only written if run belongs to a group)
-  groupUrlFile: test_group_url.txt
-
-# Collector configuration for tracking code changes
-collector:
-  repos:
-    - name: testrift-nunit
-      url: https://github.com/testrift/testrift-nunit
-
-# AI failure analysis preferences (optional)
-# These settings control the server's AI analysis behavior for this test run.
-# aiAnalysis: auto | manual | off (default: uses server config)
-# aiEmail: auto | manual | off (default: uses server config)
-# aiEmailTo: list of email addresses to override server defaults
-#aiAnalysis: auto
-#aiEmail: auto
-#aiEmailTo:
-#  - team@example.com
+  # Path to write the Target URL (optional)
+  targetUrlFile: test_target_url.txt
       path: ..

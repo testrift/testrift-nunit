@@ -93,25 +93,6 @@ namespace TestRift.NUnit
         public Dictionary<string, SourceConfig> Sources { get; set; } = new();
         public UrlFilesConfig UrlFiles { get; set; }
 
-        /// <summary>
-        /// AI failure analysis preference: "auto", "manual", or "off".
-        /// When "auto", the server runs analysis automatically when the run finishes.
-        /// When "manual", analysis can be triggered from the UI.
-        /// When "off", analysis is disabled for this run.
-        /// </summary>
-        public string AiAnalysis { get; set; }
-
-        /// <summary>
-        /// AI email preference: "auto", "manual", or "off".
-        /// Controls whether an email summary is sent after analysis completes.
-        /// </summary>
-        public string AiEmail { get; set; }
-
-        /// <summary>
-        /// Override email recipients for AI analysis reports.
-        /// If set, these addresses are used instead of the server default.
-        /// </summary>
-        public List<string> AiEmailTo { get; set; }
     }
 
     public static class ConfigManager
@@ -129,7 +110,6 @@ namespace TestRift.NUnit
 
                 var deserializer = new DeserializerBuilder()
                     .WithNamingConvention(CamelCaseNamingConvention.Instance)
-                    .IgnoreUnmatchedProperties()
                     .Build();
 
                 var cfg = deserializer.Deserialize<Config>(yamlText);
@@ -162,6 +142,8 @@ namespace TestRift.NUnit
                         source.RepositoryUrl = VarExpander.Expand(source.RepositoryUrl);
                 }
 
+                    ValidateRunContext(cfg);
+
                 // Expand run name
                 if (!string.IsNullOrEmpty(cfg.RunName))
                     cfg.RunName = VarExpander.Expand(cfg.RunName);
@@ -184,12 +166,6 @@ namespace TestRift.NUnit
                 if (!string.IsNullOrEmpty(cfg.RunId))
                     cfg.RunId = VarExpander.Expand(cfg.RunId);
 
-                // Expand AI analysis preferences
-                if (!string.IsNullOrEmpty(cfg.AiAnalysis))
-                    cfg.AiAnalysis = VarExpander.Expand(cfg.AiAnalysis);
-                if (!string.IsNullOrEmpty(cfg.AiEmail))
-                    cfg.AiEmail = VarExpander.Expand(cfg.AiEmail);
-
                 // Expand URL file paths
                 if (cfg.UrlFiles != null)
                 {
@@ -200,6 +176,26 @@ namespace TestRift.NUnit
                 }
 
                 _config = cfg;
+            }
+        }
+
+        private static void ValidateRunContext(Config cfg)
+        {
+            if (string.IsNullOrWhiteSpace(cfg.Target))
+                throw new InvalidOperationException("target is required.");
+            if (!Regex.IsMatch(cfg.Target, "^[a-z0-9]+(?:-[a-z0-9]+)*$"))
+                throw new InvalidOperationException("target must contain lowercase letters, digits, and hyphens.");
+            var purposes = new HashSet<string>(StringComparer.Ordinal) { "nightly", "release", "feature", "manual", "sanity", "rerun" };
+            if (!purposes.Contains(cfg.Purpose))
+                throw new InvalidOperationException("purpose is unsupported.");
+            if (cfg.Purpose == "rerun" != !string.IsNullOrWhiteSpace(cfg.ParentRunId))
+                throw new InvalidOperationException("parentRunId is required only when purpose is rerun.");
+            if (cfg.Sources.Count == 0)
+                throw new InvalidOperationException("sources must contain at least one source.");
+            foreach (var source in cfg.Sources)
+            {
+                if (string.IsNullOrWhiteSpace(source.Key) || string.IsNullOrWhiteSpace(source.Value.Branch) || string.IsNullOrWhiteSpace(source.Value.Revision))
+                    throw new InvalidOperationException("each source requires a role, branch, and revision.");
             }
         }
 

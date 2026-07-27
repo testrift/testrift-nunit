@@ -72,15 +72,16 @@ metadata:
     value: ${env:GITHUB_RUN_ID}
     url: ${env:GITHUB_SERVER_URL}/${env:GITHUB_REPOSITORY}/actions/runs/${env:GITHUB_RUN_ID}
 
-group:
-  name: ${env:PRODUCT}
-  metadata:
-    - name: Branch
-      value: ${env:BRANCH}
+target: nora-b26x
+purpose: nightly
+sources:
+  firmware:
+    branch: main
+    revision: ${env:FIRMWARE_REVISION}
 
 urlFiles:
   runUrlFile: test_run_url.txt
-  groupUrlFile: test_group_url.txt
+  targetUrlFile: test_target_url.txt
 ```
 
 Notes:
