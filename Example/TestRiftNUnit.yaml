@@ -45,4 +45,3 @@ urlFiles:
   runUrlFile: test_run_url.txt
   # Path to write the Target URL (optional)
   targetUrlFile: test_target_url.txt
-      path: ..
