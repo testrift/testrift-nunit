@@ -48,7 +48,13 @@ namespace TestRift.NUnit
         /// <param name="message">The log message text</param>
         /// <param name="channel">Optional channel name</param>
         /// <param name="dir">Optional direction</param>
-        public static void Log(string component, string message, string channel = null, Direction? dir = null)
+        /// <param name="timestampUtc">Optional original UTC capture time</param>
+        public static void Log(
+            string component,
+            string message,
+            string channel = null,
+            Direction? dir = null,
+            DateTime? timestampUtc = null)
         {
             if (string.IsNullOrEmpty(message)) return;
 
@@ -57,7 +63,9 @@ namespace TestRift.NUnit
 
             var nunitTestId = GetCurrentTestCaseId();
             var dirString = dir.HasValue ? (dir.Value == Direction.Tx ? "tx" : "rx") : null;
-            var timestamp = DateTime.UtcNow.ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
+            var timestamp = (timestampUtc ?? DateTime.UtcNow)
+                .ToUniversalTime()
+                .ToString("yyyy-MM-ddTHH:mm:ss.fffZ");
             var phase = TeardownMonitor.OnActivity(
                 nunitTestId,
                 webSocketHelper,
