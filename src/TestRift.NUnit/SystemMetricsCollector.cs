@@ -1,10 +1,15 @@
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
+using System.Globalization;
+using System.IO;
 using System.Net.NetworkInformation;
+using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Threading;
 using System.Threading.Tasks;
+
+[assembly: InternalsVisibleTo("TestRift.NUnit.Tests")]
 
 namespace TestRift.NUnit
 {
@@ -411,10 +416,71 @@ namespace TestRift.NUnit
             }
             else
             {
-                // For Linux/macOS, use /proc/stat or similar
-                // Fallback to 0 for now
+                TryReadProcStatTimes(out idleTime, out kernelTime, out userTime);
             }
 #endif
+        }
+
+        internal static bool TryParseProcStatTimes(string procStat, out long idleTime, out long kernelTime, out long userTime)
+        {
+            idleTime = 0;
+            kernelTime = 0;
+            userTime = 0;
+            if (string.IsNullOrEmpty(procStat))
+                return false;
+
+            using (var reader = new StringReader(procStat))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    if (!line.StartsWith("cpu ", StringComparison.Ordinal))
+                        continue;
+
+                    var parts = line.Split((char[])null, StringSplitOptions.RemoveEmptyEntries);
+                    if (parts.Length < 5)
+                        return false;
+
+                    // user nice system idle [iowait irq softirq steal guest guest_nice]
+                    long user = ParseProcLong(parts[1]);
+                    long nice = ParseProcLong(parts[2]);
+                    long system = ParseProcLong(parts[3]);
+                    long idle = ParseProcLong(parts[4]);
+                    long iowait = parts.Length > 5 ? ParseProcLong(parts[5]) : 0;
+                    long irq = parts.Length > 6 ? ParseProcLong(parts[6]) : 0;
+                    long softirq = parts.Length > 7 ? ParseProcLong(parts[7]) : 0;
+                    long steal = parts.Length > 8 ? ParseProcLong(parts[8]) : 0;
+
+                    // Match Windows GetSystemTimes: idle includes iowait, kernel
+                    // includes idle, user is user+nice. Busy = (kernel+user)-idle.
+                    idleTime = idle + iowait;
+                    kernelTime = system + irq + softirq + steal + idleTime;
+                    userTime = user + nice;
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
+        private static bool TryReadProcStatTimes(out long idleTime, out long kernelTime, out long userTime)
+        {
+            idleTime = 0;
+            kernelTime = 0;
+            userTime = 0;
+            try
+            {
+                return TryParseProcStatTimes(File.ReadAllText("/proc/stat"), out idleTime, out kernelTime, out userTime);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static long ParseProcLong(string value)
+        {
+            return long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var n) ? n : 0;
         }
 
         private static long GetAvailablePhysicalMemory()
@@ -437,6 +503,9 @@ namespace TestRift.NUnit
                     return (long)memStatus.ullAvailPhys;
                 }
             }
+
+            if (TryReadProcMemInfo(out _, out var available))
+                return available;
             return 0;
 #endif
         }
@@ -470,11 +539,9 @@ namespace TestRift.NUnit
                         return _cachedTotalMemory;
                     }
                 }
-                else
+                else if (TryReadProcMemInfo(out var total, out _))
                 {
-                    // For .NET Core on non-Windows, use GC.GetGCMemoryInfo
-                    var memInfo = GC.GetGCMemoryInfo();
-                    _cachedTotalMemory = memInfo.TotalAvailableMemoryBytes;
+                    _cachedTotalMemory = total;
                     return _cachedTotalMemory;
                 }
 #endif
@@ -487,6 +554,72 @@ namespace TestRift.NUnit
             // Fallback: assume 8GB if we can't determine
             _cachedTotalMemory = 8L * 1024 * 1024 * 1024;
             return _cachedTotalMemory;
+        }
+
+        internal static bool TryParseProcMemInfo(string procMemInfo, out long totalBytes, out long availableBytes)
+        {
+            totalBytes = 0;
+            availableBytes = 0;
+            if (string.IsNullOrEmpty(procMemInfo))
+                return false;
+
+            long memTotalKb = 0;
+            long memAvailableKb = 0;
+            long memFreeKb = 0;
+            long buffersKb = 0;
+            long cachedKb = 0;
+
+            using (var reader = new StringReader(procMemInfo))
+            {
+                string line;
+                while ((line = reader.ReadLine()) != null)
+                {
+                    var colon = line.IndexOf(':');
+                    if (colon <= 0)
+                        continue;
+                    var key = line.Substring(0, colon);
+                    var rest = line.Substring(colon + 1).Trim();
+                    var space = rest.IndexOf(' ');
+                    var number = space >= 0 ? rest.Substring(0, space) : rest;
+                    if (!long.TryParse(number, NumberStyles.Integer, CultureInfo.InvariantCulture, out var kb))
+                        continue;
+
+                    if (key == "MemTotal")
+                        memTotalKb = kb;
+                    else if (key == "MemAvailable")
+                        memAvailableKb = kb;
+                    else if (key == "MemFree")
+                        memFreeKb = kb;
+                    else if (key == "Buffers")
+                        buffersKb = kb;
+                    else if (key == "Cached")
+                        cachedKb = kb;
+                }
+            }
+
+            if (memTotalKb <= 0)
+                return false;
+
+            if (memAvailableKb <= 0)
+                memAvailableKb = memFreeKb + buffersKb + cachedKb;
+
+            totalBytes = memTotalKb * 1024;
+            availableBytes = Math.Max(0, memAvailableKb) * 1024;
+            return true;
+        }
+
+        private static bool TryReadProcMemInfo(out long totalBytes, out long availableBytes)
+        {
+            totalBytes = 0;
+            availableBytes = 0;
+            try
+            {
+                return TryParseProcMemInfo(File.ReadAllText("/proc/meminfo"), out totalBytes, out availableBytes);
+            }
+            catch
+            {
+                return false;
+            }
         }
 
         // P/Invoke declarations - shared between .NET Framework and .NET Core on Windows
